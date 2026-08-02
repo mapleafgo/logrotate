@@ -1,16 +1,19 @@
-// Package logrotate 提供按大小和/或按天滚动的日志文件写入器。
+// Package logrotate 提供按大小或按天滚动的日志文件写入器。
 //
-// 当前写入路径始终为 Config.Filename，便于 tail；归档命名：
-//   - 纯按大小：Filename.1、Filename.2、…
-//   - 按天 / 叠加：Filename.YYYY-MM-DD、Filename.YYYY-MM-DD.1、…
+// 当前写入路径始终为 Config.Filename，便于 tail。
+// 两种模式由 Daily 决定：
+//   - 纯按大小（Daily=false）：归档为 Filename.1、Filename.2、…
+//   - 按天（Daily=true）：归档为 Filename.YYYY-MM-DD、Filename.YYYY-MM-DD.1、…
 //
-// 轮转关文件前与 Close 默认 fsync，降低崩溃丢尾与归档缺尾风险。
-// 不做压缩、不按小时切分；依赖仅标准库。
+// 轮转关文件前与 Close 均 fsync，降低崩溃丢尾与归档缺尾风险。
+// 不按小时切分；依赖仅标准库。
 // Writer 非并发安全；多写者请用 OpenAsync。
 package logrotate
 
 import (
+	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,49 +22,53 @@ import (
 	"time"
 )
 
-// Config 配置按大小和/或按天的日志滚动。
-// MaxSizeMB 与 Daily 可单独或同时启用；都关闭时 Writer 仅做 append（自动建目录）。
+// Config 配置日志滚动。Daily 决定模式：false 为纯按大小，true 为按天。
 type Config struct {
 	// Filename 当前写入的日志路径（必填）。进程始终写此路径。
 	Filename string
 
-	// MaxSizeMB 单文件大小上限（MiB）。0 表示不按大小轮转。
-	MaxSizeMB int
+	// MaxFileSizeMB 单文件大小上限（MiB）。纯按大小模式触发编号轮转；
+	// 按天模式触发同日归档。0 表示不按大小轮转。
+	// 负值或过大（左移 20 位会溢出）时 Open 报错。
+	MaxFileSizeMB int
 
-	// MaxBackups 保留个数策略：
-	//   - 纯按大小（非 Daily）：保留 Filename.1 .. Filename.N 个编号归档
-	//   - Daily（含叠加）：按唯一日期保留最近 N 天（同日编号不裁，靠 MaxAgeDays 跨日清理）
-	// 0 表示不按个数裁剪。
+	// MaxBackups 纯按大小模式下保留编号归档个数（.1..N）。
+	// 按天模式下不生效。0 表示不限。
 	MaxBackups int
 
-	// Daily 是否在自然日边界轮转。
+	// MaxDays 按天模式下保留最近 N 天的归档。
+	// 纯按大小模式下不生效。0 表示不限。
+	MaxDays int
+
+	// MaxTotalSizeMB 所有归档总大小上限（MiB），超出时从最老归档开始删除。
+	// 两模式共用。0 表示不限。
+	MaxTotalSizeMB int
+
+	// Daily 是否按自然日轮转。
 	Daily bool
 
-	// MaxAgeDays 仅 Daily 时生效：删除文件名日期早于 now - MaxAgeDays 的归档。
-	// 非 Daily 时静默不生效；0 表示不按年龄清理。
-	MaxAgeDays int
-
-	// SyncOnWrite 为 true 时每次 Write 成功后 fsync（很慢，仅极致可靠场景）。
-	SyncOnWrite bool
-
-	// DisableSync 为 true 时：轮转前与 Close 均不 fsync（默认可落盘；测试可关以加速）。
-	DisableSync bool
+	// Compress 归档后是否 gzip 压缩。
+	//   - 纯按大小：每个归档独立压缩为 .N.gz。
+	//   - 按天：同日所有归档追加到一个 multi-member .YYYY-MM-DD.gz。
+	// 压缩失败不影响当前写入。
+	Compress bool
 }
 
 // Writer 是可滚动日志写入器，实现 io.WriteCloser。
 // 非并发安全：Write / Sync / Close 仅允许单 goroutine 调用。
 // 多 goroutine 写日志请用 OpenAsync（单刷盘协程独占本 Writer）。
 type Writer struct {
-	filename   string
-	maxSize    int64 // bytes；0 表示关闭按大小
-	maxBackups int
-	daily      bool
-	maxAgeDays int
-	syncWrite  bool
-	doSync     bool // 轮转前与 Close 是否 fsync
+	filename     string
+	maxFileSize  int64 // bytes；0 表示关闭按大小
+	maxBackups   int
+	maxDays      int
+	maxTotalSize int64 // bytes；0 表示不限
+	daily        bool
+	compress     bool
 
 	size int64
 	file *os.File
+
 	// day 为当前文件内容所属自然日（YYYY-MM-DD），仅 daily 时有意义。
 	day string
 
@@ -69,39 +76,58 @@ type Writer struct {
 	now func() time.Time
 }
 
-// Open 打开可滚动日志文件。
-// Filename 为空，或 MaxBackups / MaxAgeDays 为负时返回错误。
-// 默认在轮转关文件前与 Close 时 fsync；设 DisableSync 可关闭。
+// Open 打开可滚动日志文件。Filename 为空或数值配置为负时返回错误；
+// MaxFileSizeMB / MaxTotalSizeMB 过大（左移 20 位会溢出）时也返回错误。
+// 启动时立即清理超限归档。返回的 Writer 非并发安全。
 func Open(cfg Config) (*Writer, error) {
 	if strings.TrimSpace(cfg.Filename) == "" {
 		return nil, fmt.Errorf("logrotate: Filename 不能为空")
 	}
+	if cfg.MaxFileSizeMB < 0 {
+		return nil, fmt.Errorf("logrotate: MaxFileSizeMB 不能为负，got %d", cfg.MaxFileSizeMB)
+	}
 	if cfg.MaxBackups < 0 {
 		return nil, fmt.Errorf("logrotate: MaxBackups 不能为负，got %d", cfg.MaxBackups)
 	}
-	if cfg.MaxAgeDays < 0 {
-		return nil, fmt.Errorf("logrotate: MaxAgeDays 不能为负，got %d", cfg.MaxAgeDays)
+	if cfg.MaxDays < 0 {
+		return nil, fmt.Errorf("logrotate: MaxDays 不能为负，got %d", cfg.MaxDays)
+	}
+	if cfg.MaxTotalSizeMB < 0 {
+		return nil, fmt.Errorf("logrotate: MaxTotalSizeMB 不能为负，got %d", cfg.MaxTotalSizeMB)
 	}
 
-	var maxSize int64
-	if cfg.MaxSizeMB > 0 {
-		maxSize = int64(cfg.MaxSizeMB) << 20
+	// int64 最大值右移 20 位 ≈ 8 PiB 的 MiB 数，远超合理日志阈值。
+	const sizeMBLimit = int64(^uint64(0)>>1) >> 20
+
+	var maxFileSize int64
+	if cfg.MaxFileSizeMB > 0 {
+		if int64(cfg.MaxFileSizeMB) > sizeMBLimit {
+			return nil, fmt.Errorf("logrotate: MaxFileSizeMB 过大，got %d", cfg.MaxFileSizeMB)
+		}
+		maxFileSize = int64(cfg.MaxFileSizeMB) << 20
+	}
+
+	var maxTotalSize int64
+	if cfg.MaxTotalSizeMB > 0 {
+		if int64(cfg.MaxTotalSizeMB) > sizeMBLimit {
+			return nil, fmt.Errorf("logrotate: MaxTotalSizeMB 过大，got %d", cfg.MaxTotalSizeMB)
+		}
+		maxTotalSize = int64(cfg.MaxTotalSizeMB) << 20
 	}
 
 	w := &Writer{
-		filename:   cfg.Filename,
-		maxSize:    maxSize,
-		maxBackups: cfg.MaxBackups,
-		daily:      cfg.Daily,
-		maxAgeDays: cfg.MaxAgeDays,
-		syncWrite:  cfg.SyncOnWrite,
-		doSync:     !cfg.DisableSync,
-		now:        time.Now,
+		filename:     cfg.Filename,
+		maxFileSize:  maxFileSize,
+		maxBackups:   cfg.MaxBackups,
+		maxDays:      cfg.MaxDays,
+		maxTotalSize: maxTotalSize,
+		daily:        cfg.Daily,
+		compress:     cfg.Compress,
+		now:          time.Now,
 	}
 	if err := w.openExistingOrCreate(); err != nil {
 		return nil, err
 	}
-	// 启动时顺带清理超龄归档，避免只在滚动时才删。
 	w.cleanup()
 	return w, nil
 }
@@ -124,7 +150,6 @@ func (w *Writer) openExistingOrCreate() error {
 	w.file = f
 	w.size = info.Size()
 	if w.daily {
-		// 已有内容时用 mtime 的日期，重启跨日后首次 Write 会触发按天滚动。
 		if info.Size() > 0 {
 			w.day = w.dayString(info.ModTime())
 		} else {
@@ -134,9 +159,7 @@ func (w *Writer) openExistingOrCreate() error {
 	return nil
 }
 
-// Write 写入日志。写前按需按天/按大小滚动；单条超过阈值仍写出，避免吞日志。
-// 轮转失败时尽量以 append 方式恢复当前文件句柄，避免 O_TRUNC 清空未归档内容。
-// 非并发安全；多写者请用 AsyncWriter。
+// Write 写入日志。写前按需滚动；单条超过阈值仍写出，避免吞日志。
 func (w *Writer) Write(p []byte) (int, error) {
 	if w.file == nil {
 		return 0, fmt.Errorf("logrotate: 日志文件已关闭")
@@ -144,33 +167,29 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if w.daily {
 		today := w.dayString(w.now())
 		if w.day != "" && today != w.day {
-			if err := w.rotateToArchive(w.day); err != nil {
+			if err := w.rotateDaily(w.day); err != nil {
 				return 0, err
 			}
 			w.day = today
 		}
 	}
-	// 写前滚动：当前 size + 本次写入会超过阈值时先轮转。
-	if w.maxSize > 0 && w.size > 0 && w.size+int64(len(p)) > w.maxSize {
-		if err := w.rotateSize(); err != nil {
-			return 0, err
+	if w.maxFileSize > 0 && w.size > 0 && w.size+int64(len(p)) > w.maxFileSize {
+		if w.daily {
+			if err := w.rotateDaily(w.day); err != nil {
+				return 0, err
+			}
+		} else {
+			if err := w.rotateNumbered(); err != nil {
+				return 0, err
+			}
 		}
 	}
 	n, err := w.file.Write(p)
 	w.size += int64(n)
-	if err != nil {
-		return n, err
-	}
-	if w.syncWrite {
-		if err := w.file.Sync(); err != nil {
-			return n, fmt.Errorf("logrotate: Write 后 fsync 失败: %w", err)
-		}
-	}
-	return n, nil
+	return n, err
 }
 
-// Sync 将已写入数据刷到存储设备。文件已关闭时返回错误。
-// 非并发安全。
+// Sync 将已写入数据刷到存储设备。
 func (w *Writer) Sync() error {
 	if w.file == nil {
 		return fmt.Errorf("logrotate: 日志文件已关闭")
@@ -181,17 +200,14 @@ func (w *Writer) Sync() error {
 	return nil
 }
 
-// Close 关闭底层文件；默认先 fsync 再关。重复调用安全（后续为 no-op）。
-// 非并发安全。
+// Close 关闭底层文件；先 fsync 再关。重复调用安全。
 func (w *Writer) Close() error {
 	if w.file == nil {
 		return nil
 	}
 	var first error
-	if w.doSync {
-		if err := w.file.Sync(); err != nil {
-			first = fmt.Errorf("logrotate: Close 前 fsync 失败: %w", err)
-		}
+	if err := w.file.Sync(); err != nil {
+		first = fmt.Errorf("logrotate: Close 前 fsync 失败: %w", err)
 	}
 	if err := w.file.Close(); err != nil && first == nil {
 		first = err
@@ -200,40 +216,36 @@ func (w *Writer) Close() error {
 	return first
 }
 
-func (w *Writer) rotateSize() error {
-	if w.daily {
-		day := w.day
-		if day == "" {
-			day = w.dayString(w.now())
-		}
-		return w.rotateToArchive(day)
-	}
-	return w.rotateNumbered()
-}
+// ==================== 纯按大小 ====================
 
-// rotateNumbered 纯按大小：Filename -> .1 -> .2 ...
-// Rename 失败时恢复为 append 打开，绝不在原路径 O_TRUNC。
 func (w *Writer) rotateNumbered() error {
 	if err := w.prepareCloseForRotate(); err != nil {
 		return err
 	}
 
 	var rotateErr error
+	var archivePath string
+
 	if w.maxBackups > 0 {
-		oldest := fmt.Sprintf("%s.%d", w.filename, w.maxBackups)
+		suffix := ""
+		if w.compress {
+			suffix = ".gz"
+		}
+		oldest := fmt.Sprintf("%s.%d%s", w.filename, w.maxBackups, suffix)
 		_ = os.Remove(oldest)
 		for i := w.maxBackups - 1; i >= 1; i-- {
-			src := fmt.Sprintf("%s.%d", w.filename, i)
-			dst := fmt.Sprintf("%s.%d", w.filename, i+1)
+			src := fmt.Sprintf("%s.%d%s", w.filename, i, suffix)
+			dst := fmt.Sprintf("%s.%d%s", w.filename, i+1, suffix)
 			if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
-				// 备份链失败不立即返回：仍尝试归档当前文件；最终一并报告。
 				if rotateErr == nil {
 					rotateErr = fmt.Errorf("logrotate: 备份链 rename %s -> %s: %w", src, dst, err)
 				}
 			}
 		}
-		if err := os.Rename(w.filename, w.filename+".1"); err != nil {
-			rotateErr = fmt.Errorf("logrotate: 编号轮转失败 %s -> %s.1: %w", w.filename, w.filename, err)
+		archivePath = w.filename + ".1"
+		if err := os.Rename(w.filename, archivePath); err != nil {
+			rotateErr = fmt.Errorf("logrotate: 编号轮转失败 %s -> %s: %w", w.filename, archivePath, err)
+			archivePath = ""
 		}
 	} else {
 		if err := os.Remove(w.filename); err != nil && !os.IsNotExist(err) {
@@ -247,49 +259,100 @@ func (w *Writer) rotateNumbered() error {
 		}
 		return rotateErr
 	}
+	if w.compress && archivePath != "" {
+		// 压缩失败不阻断 reopenTrunc；归档以未压缩形式保留，不影响写入。
+		_ = w.compressArchive(archivePath)
+	}
+	w.cleanupTotalSize()
 	return w.reopenTrunc()
 }
 
-// rotateToArchive 将当前文件归档到 Filename.YYYY-MM-DD[.N]，再重开当前路径。
-func (w *Writer) rotateToArchive(day string) error {
+// ==================== 按天 ====================
+
+func (w *Writer) rotateDaily(day string) error {
 	if err := w.prepareCloseForRotate(); err != nil {
 		return err
 	}
-	// 空文件无需归档，直接重开即可。
-	if info, err := os.Stat(w.filename); err == nil && info.Size() == 0 {
-		return w.reopenTrunc()
-	} else if os.IsNotExist(err) {
+	if info, err := os.Stat(w.filename); (err == nil && info.Size() == 0) || os.IsNotExist(err) {
 		return w.reopenTrunc()
 	}
 
-	target, err := w.nextDatedArchive(day)
-	if err != nil {
-		if rerr := w.openExistingOrCreate(); rerr != nil {
-			return fmt.Errorf("logrotate: %v; 且无法恢复打开: %w", err, rerr)
+	if w.compress {
+		if err := w.rotateToDatedGz(day); err != nil {
+			return err
 		}
-		return err
-	}
-	if err := os.Rename(w.filename, target); err != nil {
-		if rerr := w.openExistingOrCreate(); rerr != nil {
-			return fmt.Errorf("logrotate: 归档失败 %s -> %s: %v; 且无法恢复打开: %w", w.filename, target, err, rerr)
+	} else {
+		target := w.nextDatedArchive(day)
+		if err := os.Rename(w.filename, target); err != nil {
+			if rerr := w.openExistingOrCreate(); rerr != nil {
+				return fmt.Errorf("logrotate: 归档失败 %s -> %s: %v; 且无法恢复打开: %w", w.filename, target, err, rerr)
+			}
+			return fmt.Errorf("logrotate: 归档失败 %s -> %s: %w", w.filename, target, err)
 		}
-		return fmt.Errorf("logrotate: 归档失败 %s -> %s: %w", w.filename, target, err)
 	}
-	w.cleanup()
+
+	w.cleanupDaily()
 	return w.reopenTrunc()
 }
 
-// prepareCloseForRotate 轮转前可选 fsync 再关文件。
+func (w *Writer) rotateToDatedGz(day string) error {
+	gzPath := fmt.Sprintf("%s.%s.gz", w.filename, day)
+
+	src, err := os.Open(w.filename)
+	if err != nil {
+		if rerr := w.openExistingOrCreate(); rerr != nil {
+			return fmt.Errorf("logrotate: 打开待归档 %s: %v; 恢复失败: %w", w.filename, err, rerr)
+		}
+		return fmt.Errorf("logrotate: 打开待归档 %s: %w", w.filename, err)
+	}
+	defer func() { _ = src.Close() }()
+
+	// O_APPEND 追加：每次 NewWriter 生成一个独立 gzip member，
+	// 同日多次归档合入同一文件，gunzip/zcat 可顺序读取全部 member。
+	dst, err := os.OpenFile(gzPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		if rerr := w.openExistingOrCreate(); rerr != nil {
+			return fmt.Errorf("logrotate: 创建/打开 %s: %v; 恢复失败: %w", gzPath, err, rerr)
+		}
+		return fmt.Errorf("logrotate: 创建/打开 %s: %w", gzPath, err)
+	}
+
+	gw := gzip.NewWriter(dst)
+	if _, err := io.Copy(gw, src); err != nil {
+		_ = gw.Close()
+		_ = dst.Close()
+		if rerr := w.openExistingOrCreate(); rerr != nil {
+			return fmt.Errorf("logrotate: gzip 写入 %s: %v; 恢复失败: %w", gzPath, err, rerr)
+		}
+		return fmt.Errorf("logrotate: gzip 写入 %s: %w", gzPath, err)
+	}
+	if err := gw.Close(); err != nil {
+		_ = dst.Close()
+		if rerr := w.openExistingOrCreate(); rerr != nil {
+			return fmt.Errorf("logrotate: gzip 关闭 %s: %v; 恢复失败: %w", gzPath, err, rerr)
+		}
+		return fmt.Errorf("logrotate: gzip 关闭 %s: %w", gzPath, err)
+	}
+	if err := dst.Close(); err != nil {
+		if rerr := w.openExistingOrCreate(); rerr != nil {
+			return fmt.Errorf("logrotate: 关闭 %s: %v; 恢复失败: %w", gzPath, err, rerr)
+		}
+		return fmt.Errorf("logrotate: 关闭 %s: %w", gzPath, err)
+	}
+	if err := os.Remove(w.filename); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("logrotate: 删除已归档文件 %s: %w", w.filename, err)
+	}
+	return nil
+}
+
+// ==================== 工具方法 ====================
+
 func (w *Writer) prepareCloseForRotate() error {
 	if w.file == nil {
 		return nil
 	}
-	if w.doSync {
-		if err := w.file.Sync(); err != nil {
-			// fsync 失败仍继续关文件并尝试轮转，但把错误带回会阻断写；
-			// 落盘失败时继续 rename 可能归档不完整，直接返回更安全。
-			return fmt.Errorf("logrotate: 轮转前 fsync 失败: %w", err)
-		}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("logrotate: 轮转前 fsync 失败: %w", err)
 	}
 	return w.closeFile()
 }
@@ -306,7 +369,6 @@ func (w *Writer) closeFile() error {
 func (w *Writer) reopenTrunc() error {
 	f, err := os.OpenFile(w.filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		// 尝试 append 恢复，避免后续写全部失败。
 		if rerr := w.openExistingOrCreate(); rerr != nil {
 			return fmt.Errorf("logrotate: 滚动后无法打开日志文件 %s: %v; 恢复 append 也失败: %w", w.filename, err, rerr)
 		}
@@ -317,68 +379,91 @@ func (w *Writer) reopenTrunc() error {
 	return nil
 }
 
-func (w *Writer) nextDatedArchive(day string) (string, error) {
+func (w *Writer) nextDatedArchive(day string) string {
 	base := fmt.Sprintf("%s.%s", w.filename, day)
 	if _, err := os.Stat(base); os.IsNotExist(err) {
-		return base, nil
-	} else if err != nil {
-		return "", fmt.Errorf("logrotate: stat 归档 %s: %w", base, err)
+		return base
 	}
-	for i := 1; i < 10000; i++ {
+	for i := 1; ; i++ {
 		name := fmt.Sprintf("%s.%s.%d", w.filename, day, i)
 		if _, err := os.Stat(name); os.IsNotExist(err) {
-			return name, nil
-		} else if err != nil {
-			return "", fmt.Errorf("logrotate: stat 归档 %s: %w", name, err)
+			return name
 		}
 	}
-	return "", fmt.Errorf("logrotate: 同日归档编号耗尽（%s）", day)
 }
 
-// cleanup Daily 下按 MaxAgeDays 删超龄归档，再按 MaxBackups 保留最近 N 个日期。
+// ==================== 清理 ====================
+
 func (w *Writer) cleanup() {
-	if !w.daily {
-		return
+	if w.daily {
+		w.cleanupDaily()
+	} else {
+		w.cleanupTotalSize()
 	}
+}
+
+func (w *Writer) cleanupDaily() {
 	archives := w.listDatedArchives()
 	if len(archives) == 0 {
 		return
 	}
 
-	now := w.now()
-	if w.maxAgeDays > 0 {
-		cutoff := w.dayString(now.AddDate(0, 0, -w.maxAgeDays))
+	if w.maxDays > 0 {
+		cutoff := w.dayString(w.now().AddDate(0, 0, -w.maxDays))
+		var keep []datedArchive
 		for _, a := range archives {
-			if a.day < cutoff {
+			if a.day >= cutoff {
+				keep = append(keep, a)
+			} else {
 				_ = os.Remove(a.path)
 			}
 		}
-		// 重新列举，供后续 MaxBackups 日级裁剪
-		archives = w.listDatedArchives()
+		archives = keep
 	}
 
-	// Daily 下 MaxBackups 表示保留最近 N 个「日期」（与是否按大小无关）。
-	if w.maxBackups > 0 {
-		// 按日期去重，从旧到新
-		days := uniqueDays(archives)
-		if len(days) > w.maxBackups {
-			drop := make(map[string]struct{}, len(days)-w.maxBackups)
-			for _, d := range days[:len(days)-w.maxBackups] {
-				drop[d] = struct{}{}
+	if w.maxTotalSize > 0 {
+		var total int64
+		for _, a := range archives {
+			total += a.size
+		}
+		for _, a := range archives {
+			if total <= w.maxTotalSize {
+				break
 			}
-			for _, a := range archives {
-				if _, ok := drop[a.day]; ok {
-					_ = os.Remove(a.path)
-				}
-			}
+			_ = os.Remove(a.path)
+			total -= a.size
 		}
 	}
 }
 
+func (w *Writer) cleanupTotalSize() {
+	if w.maxTotalSize <= 0 {
+		return
+	}
+	archives := w.listNumberedArchives()
+	if len(archives) == 0 {
+		return
+	}
+	var total int64
+	for _, a := range archives {
+		total += a.size
+	}
+	for _, a := range archives {
+		if total <= w.maxTotalSize {
+			break
+		}
+		_ = os.Remove(a.path)
+		total -= a.size
+	}
+}
+
+// ==================== 归档列表 ====================
+
 type datedArchive struct {
 	path string
 	day  string
-	seq  int // 0 = Filename.YYYY-MM-DD，>0 = .N
+	seq  int
+	size int64
 }
 
 func (w *Writer) listDatedArchives() []datedArchive {
@@ -406,10 +491,15 @@ func (w *Writer) listDatedArchives() []datedArchive {
 		if !ok {
 			continue
 		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
 		out = append(out, datedArchive{
 			path: filepath.Join(dir, name),
 			day:  day,
 			seq:  seq,
+			size: info.Size(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -421,8 +511,57 @@ func (w *Writer) listDatedArchives() []datedArchive {
 	return out
 }
 
-// parseDatedSuffix 解析 "2006-01-02" 或 "2006-01-02.3"。
+type numberedArchive struct {
+	path string
+	n    int
+	size int64
+}
+
+func (w *Writer) listNumberedArchives() []numberedArchive {
+	dir := filepath.Dir(w.filename)
+	if dir == "" {
+		dir = "."
+	}
+	base := filepath.Base(w.filename)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	prefix := base + "."
+	var out []numberedArchive
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(name, prefix)
+		n, ok := parseNumberedSuffix(rest)
+		if !ok {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, numberedArchive{
+			path: filepath.Join(dir, name),
+			n:    n,
+			size: info.Size(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		// 编号大的更旧（链移位时被推向高编号），降序使最老归档排首，
+		// 供 cleanupTotalSize 从最老开始删。
+		return out[i].n > out[j].n
+	})
+	return out
+}
+
 func parseDatedSuffix(rest string) (day string, seq int, ok bool) {
+	rest = strings.TrimSuffix(rest, ".gz")
 	if len(rest) < 10 {
 		return "", 0, false
 	}
@@ -443,17 +582,49 @@ func parseDatedSuffix(rest string) (day string, seq int, ok bool) {
 	return day, n, true
 }
 
-func uniqueDays(archives []datedArchive) []string {
-	seen := make(map[string]struct{})
-	var days []string
-	for _, a := range archives {
-		if _, ok := seen[a.day]; ok {
-			continue
-		}
-		seen[a.day] = struct{}{}
-		days = append(days, a.day)
+func parseNumberedSuffix(rest string) (n int, ok bool) {
+	rest = strings.TrimSuffix(rest, ".gz")
+	n, err := strconv.Atoi(rest)
+	if err != nil || n < 1 {
+		return 0, false
 	}
-	return days
+	return n, true
+}
+
+// ==================== 压缩 ====================
+
+func (w *Writer) compressArchive(path string) error {
+	src, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("logrotate: 压缩打开 %s: %w", path, err)
+	}
+	defer func() { _ = src.Close() }()
+
+	dstPath := path + ".gz"
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("logrotate: 压缩创建 %s: %w", dstPath, err)
+	}
+
+	gw := gzip.NewWriter(dst)
+	if _, err := io.Copy(gw, src); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstPath)
+		return fmt.Errorf("logrotate: 压缩写入 %s: %w", dstPath, err)
+	}
+	if err := gw.Close(); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstPath)
+		return fmt.Errorf("logrotate: 压缩关闭 gzip %s: %w", dstPath, err)
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(dstPath)
+		return fmt.Errorf("logrotate: 压缩关闭 %s: %w", dstPath, err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("logrotate: 压缩后删除原文件 %s: %w", path, err)
+	}
+	return nil
 }
 
 func (w *Writer) dayString(t time.Time) string {
