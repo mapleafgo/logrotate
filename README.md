@@ -1,5 +1,7 @@
 # logrotate
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/mapleafgo/logrotate.svg)](https://pkg.go.dev/github.com/mapleafgo/logrotate)
+
 轻量 Go 日志滚动库：按大小或按天。零第三方依赖。
 
 当前写入路径始终固定为配置的 `Filename`（便于 `tail -f`）。两种模式由 `Daily` 决定，完全独立：
@@ -19,10 +21,12 @@
 ## 安装
 
 ```bash
-go get github.com/mapleafgo/logrotate
+go get github.com/mapleafgo/logrotate@v0.1.0
 ```
 
-本地尚未推送时可用 replace：
+API 文档见 [pkg.go.dev](https://pkg.go.dev/github.com/mapleafgo/logrotate)。
+
+本地联调或使用未发布版本时，可用 replace 指向本地路径：
 
 ```go
 // go.mod
@@ -128,7 +132,3 @@ slog.SetDefault(slog.New(slog.NewJSONHandler(w, nil)))
 | 异步 `Close` | 已成功入队的日志排空后落盘 |
 | 异步入队成功 | 不保证已刷盘；错误见 `LastError()` / `Close` |
 | 进程 `kill -9` / 断电 | 未 fsync 的尾部仍可能丢 |
-
-## 与 codex-api-gateway
-
-逻辑提取自 `codex-api-gateway` 的 `internal/logging/rotate.go`（按大小部分），并扩展按天、压缩、总大小清理与异步包装。网关侧接入可作为后续独立变更。
