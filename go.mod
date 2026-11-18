@@ -1,3 +1,3 @@
-module github.com/mapleafgo/logrotate
+module github.com/mapleafgo/logrotate/v2
 
-go 1.22
+go 1.26.0

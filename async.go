@@ -1,14 +1,20 @@
 package logrotate
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"sync"
 	"sync/atomic"
 )
 
 // ErrDropped 表示异步队列已满且策略为 FullDropNewest，当前写入被丢弃。
 var ErrDropped = errors.New("logrotate: 异步队列已满，已丢弃本条日志")
+
+// ErrClosed 表示异步写入器已停止接收；也可用 errors.Is 匹配 fs.ErrClosed。
+var ErrClosed = fmt.Errorf("logrotate: 异步日志已关闭: %w", fs.ErrClosed)
 
 // FullPolicy 异步队列满时的行为。
 type FullPolicy int
@@ -48,15 +54,17 @@ type AsyncWriter struct {
 	closeCh chan struct{} // Close 时先关闭，解除阻塞中的 Write
 	policy  FullPolicy
 
-	writers   sync.WaitGroup // 在途 Write（避免 close(ch) 时仍有 send）
+	admission sync.Mutex
+	senders   sync.WaitGroup // 已准入、可能发送到 ch 的调用
 	loopWG    sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
 
 	dropped atomic.Uint64
 
-	errMu    sync.Mutex
-	writeErr error
+	errMu       sync.Mutex
+	lastErr     error
+	deliveryErr error // 仅由 loop 写，Close 在 loop 结束后读取
 }
 
 // asyncMsg 保证 sink 的 Write/Sync 只在 loop 协程执行，不破坏底层 *Writer 单所有者契约。
@@ -65,11 +73,14 @@ type asyncMsg struct {
 	syncDone chan error
 }
 
-// OpenAsync 启动后台刷盘。sink 不可为 nil。
+// OpenAsync 启动后台刷盘。sink 不可为 nil，且成功后由 AsyncWriter 独占并关闭。
 // Write 会拷贝 p，调用方可复用缓冲区。
 func OpenAsync(sink FileSink, cfg AsyncConfig) (*AsyncWriter, error) {
 	if sink == nil {
 		return nil, fmt.Errorf("logrotate: async sink 不能为 nil")
+	}
+	if cfg.FullPolicy != FullBlock && cfg.FullPolicy != FullDropNewest {
+		return nil, fmt.Errorf("logrotate: 未知的异步队列满策略 %d", cfg.FullPolicy)
 	}
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueueSize
@@ -90,51 +101,60 @@ func (aw *AsyncWriter) loop() {
 	for msg := range aw.ch {
 		if msg.syncDone != nil {
 			err := aw.sink.Sync()
-			// 成功则清除，失败则更新为最近一次，便于运维看当前健康状态。
-			aw.setWriteErr(err)
+			aw.setLastError(err)
+			if err == nil {
+				err = aw.deliveryErr
+			} else if aw.deliveryErr != nil {
+				err = errors.Join(aw.deliveryErr, err)
+			}
 			msg.syncDone <- err
 			continue
 		}
-		if _, err := aw.sink.Write(msg.data); err != nil {
-			aw.setWriteErr(err)
-		} else {
-			aw.setWriteErr(nil)
+		n, err := aw.sink.Write(msg.data)
+		if err == nil && n != len(msg.data) {
+			err = io.ErrShortWrite
 		}
+		if aw.deliveryErr == nil {
+			aw.deliveryErr = err
+		}
+		aw.setLastError(err)
 	}
 }
 
-func (aw *AsyncWriter) setWriteErr(err error) {
+func (aw *AsyncWriter) setLastError(err error) {
 	aw.errMu.Lock()
-	defer aw.errMu.Unlock()
-	// nil 表示恢复健康；非 nil 为最近一次刷盘错误。
-	aw.writeErr = err
+	aw.lastErr = err
+	aw.errMu.Unlock()
+}
+
+// admit registers a sender before Close can seal admission and wait.
+func (aw *AsyncWriter) admit() bool {
+	aw.admission.Lock()
+	defer aw.admission.Unlock()
+	select {
+	case <-aw.closeCh:
+		return false
+	default:
+		aw.senders.Add(1)
+		return true
+	}
 }
 
 // Write 将日志入队。默认队列满时阻塞；FullDropNewest 时可能返回 ErrDropped。
-// 已 Close 后返回错误。会拷贝 p。并发安全。
+// 停止接收后返回 ErrClosed。会拷贝 p。并发安全。
 func (aw *AsyncWriter) Write(p []byte) (int, error) {
+	if !aw.admit() {
+		return 0, ErrClosed
+	}
+	defer aw.senders.Done()
 	if len(p) == 0 {
 		return 0, nil
 	}
-	cp := make([]byte, len(p))
-	copy(cp, p)
-	msg := asyncMsg{data: cp}
-
-	// 先登记在途，再判断 closed，避免 Close 的 Wait 漏掉并发 Write。
-	// closeCh 已关闭时，接收立即就绪，不会走到对 ch 的 send。
-	aw.writers.Add(1)
-	defer aw.writers.Done()
-
-	select {
-	case <-aw.closeCh:
-		return 0, fmt.Errorf("logrotate: 异步日志已关闭")
-	default:
-	}
-
+	msg := asyncMsg{data: bytes.Clone(p)}
 	if aw.policy == FullDropNewest {
 		select {
 		case <-aw.closeCh:
-			return 0, fmt.Errorf("logrotate: 异步日志已关闭")
+			return 0, ErrClosed
 		case aw.ch <- msg:
 			return len(p), nil
 		default:
@@ -145,7 +165,7 @@ func (aw *AsyncWriter) Write(p []byte) (int, error) {
 
 	select {
 	case <-aw.closeCh:
-		return 0, fmt.Errorf("logrotate: 异步日志已关闭")
+		return 0, ErrClosed
 	case aw.ch <- msg:
 		return len(p), nil
 	}
@@ -161,51 +181,40 @@ func (aw *AsyncWriter) Dropped() uint64 {
 func (aw *AsyncWriter) LastError() error {
 	aw.errMu.Lock()
 	defer aw.errMu.Unlock()
-	return aw.writeErr
+	return aw.lastErr
 }
 
-// Sync 将已由 loop 写出的数据刷到存储（不排空队列）。请求会入队，由刷盘协程串行执行，
-// 与 Write 并发安全。停机请用 Close。已 Close 后返回错误。
-// 注意：队列中尚未写出的条目不会被本方法刷盘。
+// Sync 在队列中放入 FIFO 屏障；先前已入队的记录写完后同步底层。
+// 返回首个后台写入错误及本次同步错误（若有）。停止接收后返回 ErrClosed。并发安全。
 func (aw *AsyncWriter) Sync() error {
-	// 与 Write 一样登记在途，避免 Close 在 Sync 仍占着 channel 时 close(ch)。
-	aw.writers.Add(1)
-	defer aw.writers.Done()
-
+	if !aw.admit() {
+		return ErrClosed
+	}
 	done := make(chan error, 1)
-	msg := asyncMsg{syncDone: done}
-	// Sync 始终阻塞入队（即使 FullDropNewest），丢弃 fsync 请求没有意义。
 	select {
 	case <-aw.closeCh:
-		return fmt.Errorf("logrotate: 异步日志已关闭")
-	case aw.ch <- msg:
+		aw.senders.Done()
+		return ErrClosed
+	case aw.ch <- asyncMsg{syncDone: done}:
+		aw.senders.Done()
 		return <-done
 	}
 }
 
-// Close 停止接收、等待在途 Write、排空队列、Sync 并关闭底层。可重复调用。
-// 返回刷盘过程中遇到的第一个错误（若有）。
+// Close 停止接收、唤醒等待入队的调用、排空队列、同步并关闭底层。
+// 返回首个后台写入错误以及最终同步和关闭错误（若有）。重复调用返回同一结果。
 func (aw *AsyncWriter) Close() error {
 	aw.closeOnce.Do(func() {
-		// 1) 广播关闭，阻塞中的 Write 退出且不再 send
+		aw.admission.Lock()
 		close(aw.closeCh)
-		// 2) 等所有在途 Write 结束，再 close 队列，避免 send on closed channel
-		aw.writers.Wait()
+		aw.admission.Unlock()
+		aw.senders.Wait()
 		close(aw.ch)
-		// 3) 排空并退出 loop
 		aw.loopWG.Wait()
 
-		if err := aw.sink.Sync(); err != nil {
-			aw.closeErr = err
-		}
-		if err := aw.sink.Close(); err != nil && aw.closeErr == nil {
-			aw.closeErr = err
-		}
-		aw.errMu.Lock()
-		if aw.writeErr != nil && aw.closeErr == nil {
-			aw.closeErr = aw.writeErr
-		}
-		aw.errMu.Unlock()
+		syncErr := aw.sink.Sync()
+		closeErr := aw.sink.Close()
+		aw.closeErr = errors.Join(aw.deliveryErr, syncErr, closeErr)
 	})
 	return aw.closeErr
 }
