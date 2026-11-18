@@ -1,60 +1,88 @@
-# logrotate v2
+<img src="docs/logo.png" alt="logrotate logo" width="144">
 
-轻量 Go 日志轮转库，支持按自然日和大小组合切卷，无第三方依赖。需要 Go 1.26 或更高版本。
+# logrotate
 
-发布支持范围为 Linux、Windows 和 macOS。
+[![Go Reference](https://pkg.go.dev/badge/github.com/mapleafgo/logrotate/v2.svg)](https://pkg.go.dev/github.com/mapleafgo/logrotate/v2)
+[![CI](https://github.com/mapleafgo/logrotate/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mapleafgo/logrotate/actions/workflows/ci.yml)
+
+为 Go 应用提供按自然日和文件大小轮转的日志写入器，支持 gzip 归档、自动保留清理和可选的并发异步写入。实现仅依赖 Go 标准库，可用作 `log/slog` 的输出。
 
 ## 安装
 
-`v2.0.0` 尚未发布。正式标签发布后，在应用的 Go 模块中运行：
+需要 **Go 1.26 或更高版本**；支持 Linux、macOS 和 Windows。v2 目前为[预发行版](https://github.com/mapleafgo/logrotate/releases/tag/v2.0.0-rc.1)，使用时请指定版本：
 
-~~~sh
-go get github.com/mapleafgo/logrotate/v2@v2.0.0
-~~~
+```sh
+go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.1
+```
 
-~~~go
+## 快速开始
+
+下面的示例将一条 JSON 日志写入 `logs/app.log`，并在退出前显式同步和关闭文件：
+
+```go
 package main
 
 import (
-    "log"
-    "log/slog"
+	"errors"
+	"log"
+	"log/slog"
 
-    "github.com/mapleafgo/logrotate/v2"
+	"github.com/mapleafgo/logrotate/v2"
 )
 
 func main() {
-    w, err := logrotate.Open(logrotate.Config{
-        Filename: "logs/app.log", Daily: true,
-        MaxFileMiB: 128, HistoryDays: 7,
-        TotalArchiveMiB: 2048, Compress: true,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    slog.New(slog.NewJSONHandler(w, nil)).Info("application started")
-    if err := w.Close(); err != nil {
-        log.Fatal(err)
-    }
+	w, err := logrotate.Open(logrotate.Config{
+		Filename:        "logs/app.log",
+		Daily:           true,
+		MaxFileMiB:      128,
+		HistoryDays:     7,
+		TotalArchiveMiB: 2048,
+		Compress:        true,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	slog.New(slog.NewJSONHandler(w, nil)).Info("application started")
+
+	syncErr := w.Sync()
+	if err := errors.Join(syncErr, w.Close()); err != nil {
+		log.Fatal(err)
+	}
 }
-~~~
+```
 
-有关实现分工、发布验收和历史资料，见[文档索引](docs/README.md)。
+`slog.Info` 不返回写入错误。若需要逐次检查写入结果，请直接调用 `Write` 并处理其返回值。
 
-## 轮转与保留
+## 配置
 
-按日切卷、归档日期和历史保留统一使用运行环境的本地时区，库不提供时区覆盖。
+| 字段 | 零值 | 行为 |
+| --- | --- | --- |
+| `Filename` | 无效 | 活动日志路径，必填；不接受符号链接或 `..` 路径段。 |
+| `Daily` | 关闭 | 跨自然日后的首次非空写入触发切卷。 |
+| `MaxFileMiB` | 不限 | 非空文件追加后将超过此大小时，先切卷再写入。 |
+| `HistoryDays` | 不限 | 按归档日期保留最近 N 个自然日，包含今天。 |
+| `TotalArchiveMiB` | 不限 | 正式归档总量上限，不含活动文件和待压缩文件。 |
+| `Compress` | 关闭 | 将新封存的卷独立压缩为 gzip。 |
 
-大小配置以整数 MiB 为单位（1 MiB = 1,048,576 字节）。
+大小单位为 MiB（1 MiB = 1,048,576 字节）。日期以进程本地时区为准。按日与按大小可以组合；没有写入时不会定时切卷。单次写入不拆分，超大记录可能让活动文件超过大小阈值。
 
-- `Filename` 是固定的活动路径。它必须指向普通文件，不接受符号链接或 `..` 路径段。新文件默认权限为 `0600`；替换文件和压缩归档沿用源文件权限位，受 umask 限制。
-- 非空写入前判断是否切卷：`Daily` 启用时按自然日切分；`MaxFileMiB` 非零时按大小切分。两者可组合。只有非空活动文件才会按大小切卷，恰好达到阈值不切；超大单条整条写入，不创建空卷。没有写入时不定时切卷。
-- 归档位于 `Filename + ".archives"`，按 `YYYY-MM-DD.N` 命名；启用 `Compress` 后每卷独立 gzip。压缩成功发布前保留原件。
-- `HistoryDays` 包含今天，先删除过期卷，再按从旧到新清理到 `TotalArchiveMiB` 限额。两个限制可独立启用，零值关闭；总量仅计算正式归档，不是磁盘硬配额。恢复、压缩和清理由单个后台 worker 串行执行，启动及切卷不等待维护完成。维护失败可通过底层 `Writer.MaintenanceError()` 查询，不计入 `AsyncWriter.LastError()`；`Close` 会返回尚未解决的维护错误。启动时恢复磁盘上的待压缩卷，即使当前未开启轮转。维护失败后，无新通知时按 1、2、4 秒最多重试三次；关闭不等待尚未触发的重试。
-- 活动文件重开失败时，刚封存的卷不参与删除；后续写入重开成功后，后台重新评估保留策略。若受保护及本轮无法删除的正式归档合计已超过容量上限，后台停止按容量删卷并报告错误；按日期清理不受此限制。
+## 并发、同步与退出
 
-## 并发和退出
+- **单 goroutine 写入**：直接使用 `Open` 返回的 `Writer`。并发写入时用 `OpenAsync(w, AsyncConfig{})` 包装；包装成功后由异步 writer 独占并关闭底层。活动文件和归档目录不得与其他 writer 或外部轮转工具共用。
+- **异步队列**：默认 1024 条，队列满时阻塞。显式选择 `FullDropNewest` 时，满队列拒收当前记录并返回 `ErrDropped`。异步 `Write` 成功只表示已入队；`LastError()` 提供最近一次后台写入或同步结果。
+- **显式同步**：异步 `Sync()` 等待屏障前已入队的记录交付，再同步底层。`Writer.Sync()` 只同步当前活动文件，不保证新建路径的目录项持久化，也不等待归档维护。
+- **正常退出**：先停止日志生产者；需要确认持久化时，显式调用并检查 `Sync()`。无论同步是否成功都应调用并检查 `Close()`。关闭会排空已接收的异步记录并等待归档维护收尾，不隐式同步、不设超时。首个后台写入错误仍会由后续 `Sync()` 和 `Close()` 返回。
 
-同步 `Writer` 由单个 goroutine 使用；多 goroutine 写入时，用 `OpenAsync(w, AsyncConfig{})` 包装并转交底层所有权。默认队列满时阻塞；`FullDropNewest` 会返回 `ErrDropped`。异步 `Write` 成功只表示已入队。异步 `Sync` 等待屏障前已入队的记录交付，再同步底层。内置 `Writer.Sync` 只同步当前活动文件，不保证新建路径的目录项持久化，也不等待归档维护。退出时先停止生产者；需要确认持久化时，先显式调用并检查 `Sync`，然后调用并检查 `Close`（即使 `Sync` 失败也应关闭）。`Close` 不隐式同步，也没有内置超时；异步层会排空已接收的队列，底层会等待归档维护收尾。`LastError()` 表示最近一次后台写入或同步的结果，后续成功会清除它；首个后台写入失败仍由后续 `Sync` 和 `Close` 返回。使用相对路径时，Writer 关闭前不要改变进程工作目录。
+使用相对路径时，关闭前不要改变进程工作目录。新活动文件默认权限为 `0600`；替换文件和压缩归档沿用源文件的权限位，受 umask 限制。
+
+## 归档与保留
+
+归档位于 `Filename + ".archives"`，命名为 `YYYY-MM-DD.N`，压缩后加 `.gz`。启动和切卷会触发独立的后台归档维护；正式归档发布前保留待压缩原件，重启后可恢复，当前关闭轮转也不影响启动恢复。
+
+后台先删除过期卷，再按从旧到新的顺序满足容量上限；两项限制可独立启用。容量上限不是磁盘硬配额。活动文件重开失败时会保护刚封存的卷，待重开成功后重新评估；若不可删除卷已超过容量上限，停止容量清理并报告错误。
+
+维护失败通过 `Writer.MaintenanceError()` 或 `Close()` 报告，不计入 `AsyncWriter.LastError()`。没有新维护通知时，按 1、2、4 秒最多重试三次；关闭不等待尚未触发的重试。
 
 ## 从旧版升级
 
@@ -71,3 +99,9 @@ func main() {
 1. 停止日志生产者，关闭 v2 writer 并检查 `Close` 的返回值，确认没有 writer 仍在写入或维护归档；若报错，先核对活动文件和待处理归档。
 2. 备份当前活动文件、旧归档与整个 `Filename + ".archives"` 目录（含待处理卷）。单独保留 v2 归档，不要改名为旧格式、混入旧归档或覆盖当前活动文件。
 3. 恢复升级前的应用构建（原依赖版本、不带 `/v2` 的 import 路径及旧配置）和旧版采集规则。启动旧 writer 接管同一活动路径，确认新日志能写入、切卷并被采集；v2 归档通过独立规则采集或留存，不会自动转回旧格式。
+
+## 更多文档
+
+- [Go API 参考](https://pkg.go.dev/github.com/mapleafgo/logrotate/v2)
+- [发布记录](https://github.com/mapleafgo/logrotate/releases)
+- [项目文档索引](docs/README.md)
