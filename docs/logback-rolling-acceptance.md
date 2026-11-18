@@ -1,8 +1,8 @@
-# Logback 轮转实施验收
+# 轮转验证记录
 
 ## 历史验证记录
 
-以下记录不代表当前候选版本的发布验收。
+以下数据只对应各自测试版本与环境。正式发布按[发布验收](release.md)执行。
 
 - Linux：`go vet ./...`、`go test -race -count=3 ./...` 通过。
 - Windows amd64、macOS arm64：交叉构建通过，未在目标系统运行。
@@ -37,11 +37,8 @@ Go 1.26.0 下 Linux vet 和 10 轮竞态测试通过；Windows amd64 与 macOS a
 
 复现：将 TMPDIR 指向目标磁盘上的独立临时目录（不是模块根目录），运行 `GOTOOLCHAIN=go1.26.0 go test -run "^$" -bench "^BenchmarkRollingPaced" -benchtime=512x -count=2`。积压为采样值，可能漏掉采样间峰值；节奏负载不是饱和吞吐测试。
 
-## 发布验收
+## 候选验证记录
 
-发布范围为 Linux、Windows、macOS；不支持 Plan 9。正式发布前，对同一候选版本记录以下实际结果：
-
-- **原生 CI**：在 [CI 矩阵](../.github/workflows/ci.yml) 的 Linux、Windows、macOS runner 上实际执行 `go vet -mod=readonly ./...` 和 `go test -mod=readonly -race ./...`，记录候选提交、各平台结果和 CI 运行链接。交叉编译不能替代原生运行。
-- **外部模块**：在仓库外新建独立 Go 模块，禁用工作区（`GOWORK=off`），不使用本地 `replace`，以 `go get github.com/mapleafgo/logrotate/v2@<候选版本>` 获取明确的候选版本。核对解析出的版本，使用公开 API 执行打开、写入、切卷和关闭的冒烟验证并核对活动文件与归档；记录候选版本、Go 版本、命令及结果。仓库内测试或对本地 checkout 的验证不能替代该结果。
-
-本记录尚未收录上述候选版本的实际结果；两项均有通过证据后才能认定发布验收通过。
+- `ad27ff5`：本地 Linux、Go 1.26.0 的 `go vet`、主模块竞态测试与 [v0.1.0 → v2 → v0.1.0 往返测试](../tests/migration/migration_test.go)通过；往返测试已纳入原生 CI。
+- 同一提交用临时本地 Git 镜像提供 `v2.0.0-rc.1`，独立模块无 `replace` 安装并通过往返测试。该标签不是远端发布物。
+- 仍待同一候选版本的远端原生 CI 结果与从远端安装的独立模块冒烟结果。

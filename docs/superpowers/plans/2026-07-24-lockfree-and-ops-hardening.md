@@ -1,6 +1,6 @@
 # 无锁 Writer 与运维加固 Implementation Plan
 
-> **For agentic workers:** 本仓库当前无 git；跳过 commit 步骤。按任务顺序 TDD 实现。
+> 历史实施计划，仅供追溯；其中的旧接口、Go 版本和执行说明不适用于 v2。当前规则见 [README](../../../README.md)。
 
 **Goal:** 去掉 `Writer` 写路径大锁；统一 Daily 下按日期的 `MaxBackups` 裁剪；为 `AsyncWriter` 增加 `LastError()`。
 

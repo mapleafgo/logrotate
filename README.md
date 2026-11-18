@@ -2,9 +2,11 @@
 
 轻量 Go 日志轮转库，支持按自然日和大小组合切卷，无第三方依赖。需要 Go 1.26 或更高版本。
 
-发布支持范围为 Linux、Windows 和 macOS；不支持 Plan 9。原生 CI 和外部模块验证的要求见[发布验收](docs/logback-rolling-acceptance.md#发布验收)。
+发布支持范围为 Linux、Windows 和 macOS。
 
-v2 发布后可用：
+## 安装
+
+`v2.0.0` 尚未发布。正式标签发布后，在应用的 Go 模块中运行：
 
 ~~~sh
 go get github.com/mapleafgo/logrotate/v2@v2.0.0
@@ -16,14 +18,13 @@ package main
 import (
     "log"
     "log/slog"
-    "time"
 
     "github.com/mapleafgo/logrotate/v2"
 )
 
 func main() {
     w, err := logrotate.Open(logrotate.Config{
-        Filename: "logs/app.log", Daily: true, Location: time.UTC,
+        Filename: "logs/app.log", Daily: true,
         MaxFileMiB: 128, HistoryDays: 7,
         TotalArchiveMiB: 2048, Compress: true,
     })
@@ -37,19 +38,23 @@ func main() {
 }
 ~~~
 
+有关实现分工、发布验收和历史资料，见[文档索引](docs/README.md)。
+
 ## 轮转与保留
+
+按日切卷、归档日期和历史保留统一使用运行环境的本地时区，库不提供时区覆盖。
 
 大小配置以整数 MiB 为单位（1 MiB = 1,048,576 字节）。
 
 - `Filename` 是固定的活动路径。它必须指向普通文件，不接受符号链接或 `..` 路径段。新文件默认权限为 `0600`；替换文件和压缩归档沿用源文件权限位，受 umask 限制。
-- 非空写入前判断是否切卷：`Daily` 启用时按 `Location` 的自然日切分（nil 表示本地时区）；`MaxFileMiB` 非零时按大小切分。两者可组合。超大单条不拆分，不创建空卷。
+- 非空写入前判断是否切卷：`Daily` 启用时按自然日切分；`MaxFileMiB` 非零时按大小切分。两者可组合。只有非空活动文件才会按大小切卷，恰好达到阈值不切；超大单条整条写入，不创建空卷。没有写入时不定时切卷。
 - 归档位于 `Filename + ".archives"`，按 `YYYY-MM-DD.N` 命名；启用 `Compress` 后每卷独立 gzip。压缩成功发布前保留原件。
-- `HistoryDays` 包含今天，先删除过期卷，再按从旧到新清理到 `TotalArchiveMiB` 限额。两个限制可独立启用，零值关闭；总量仅计算正式归档，不是磁盘硬配额。恢复、压缩和清理由单个后台 worker 串行执行，启动及切卷不等待维护完成。维护失败可通过底层 `Writer.MaintenanceError()` 查询，不计入 `AsyncWriter.LastError()`；`Close` 会返回尚未解决的维护错误。磁盘上的待压缩卷可在重启后继续处理。
+- `HistoryDays` 包含今天，先删除过期卷，再按从旧到新清理到 `TotalArchiveMiB` 限额。两个限制可独立启用，零值关闭；总量仅计算正式归档，不是磁盘硬配额。恢复、压缩和清理由单个后台 worker 串行执行，启动及切卷不等待维护完成。维护失败可通过底层 `Writer.MaintenanceError()` 查询，不计入 `AsyncWriter.LastError()`；`Close` 会返回尚未解决的维护错误。启动时恢复磁盘上的待压缩卷，即使当前未开启轮转。维护失败后，无新通知时按 1、2、4 秒最多重试三次；关闭不等待尚未触发的重试。
 - 活动文件重开失败时，刚封存的卷不参与删除；后续写入重开成功后，后台重新评估保留策略。若受保护及本轮无法删除的正式归档合计已超过容量上限，后台停止按容量删卷并报告错误；按日期清理不受此限制。
 
 ## 并发和退出
 
-同步 `Writer` 由单个 goroutine 使用；多 goroutine 写入时，用 `OpenAsync(w, AsyncConfig{})` 包装并转交底层所有权。默认队列满时阻塞；`FullDropNewest` 会返回 `ErrDropped`。异步 `Write` 成功只表示已入队，`Sync` 同步此前入队的记录。`Sync` 不等待归档维护。退出时先停止生产者，再检查 `Close` 的返回值；关闭会等待已触发的归档维护收尾，积压可能延长关闭时间。后台写入失败不会被后续成功掩盖。使用相对路径时，Writer 关闭前不要改变进程工作目录。
+同步 `Writer` 由单个 goroutine 使用；多 goroutine 写入时，用 `OpenAsync(w, AsyncConfig{})` 包装并转交底层所有权。默认队列满时阻塞；`FullDropNewest` 会返回 `ErrDropped`。异步 `Write` 成功只表示已入队。异步 `Sync` 等待屏障前已入队的记录交付，再同步底层。内置 `Writer.Sync` 只同步当前活动文件，不保证新建路径的目录项持久化，也不等待归档维护。退出时先停止生产者；需要确认持久化时，先显式调用并检查 `Sync`，然后调用并检查 `Close`（即使 `Sync` 失败也应关闭）。`Close` 不隐式同步，也没有内置超时；异步层会排空已接收的队列，底层会等待归档维护收尾。`LastError()` 表示最近一次后台写入或同步的结果，后续成功会清除它；首个后台写入失败仍由后续 `Sync` 和 `Close` 返回。使用相对路径时，Writer 关闭前不要改变进程工作目录。
 
 ## 从旧版升级
 
@@ -57,7 +62,7 @@ func main() {
 
 | 旧版配置 | v2 配置 |
 | --- | --- |
-| `Daily: true`，`MaxDays: N`（`N > 0`） | `HistoryDays: N+1`。旧版保留今天及之前 N 个自然日，v2 的天数已包含今天。要保留相同的日期边界，请沿用旧版的本地时区（`Location: nil`，且进程时区不变）。 |
+| `Daily: true`，`MaxDays: N`（`N > 0`） | `HistoryDays: N+1`。旧版保留今天及之前 N 个自然日，v2 的天数已包含今天。要保留相同的日期边界，请沿用旧版的本地时区。 |
 | `Daily: false`（纯按大小轮转） | `HistoryDays: 0`。旧版纯大小模式不应用 `MaxDays`；v2 即使关闭 `Daily`，正数 `HistoryDays` 也会按日期清理归档。 |
 | `MaxDays: 0` | `HistoryDays: 0`，关闭按日期清理，不影响容量限制。 |
 
