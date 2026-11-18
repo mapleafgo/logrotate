@@ -11,8 +11,8 @@
 
 ## 与本库对照
 
-- **异步写入：** [`AsyncWriter.Write`](../async.go#L143-L172) 对非空输入成功只表示已入队。[后台循环](../async.go#L99-L121) 会把无错误的短写转成 `io.ErrShortWrite` 并记住首个投递错误。[`Sync`](../async.go#L187-L201) 是 FIFO 屏障：处理此前已入队的记录后同步 sink，返回首个投递错误和本次同步错误（若有）；[`Close`](../async.go#L204-L219) 排空并关闭，合并投递和底层关闭错误，但不隐式 Sync。
-- **活动文件：** [`Writer.Write/Sync/Close`](../rolling.go#L315-L350) 分别转交文件 Write、仅同步当前活动文件、关闭活动文件并等待归档维护。Close 不同步活动文件，但会合并关闭错误和未解决的维护错误；活动文件的[创建路径](../rolling.go#L111-L137) 本身不显式同步父目录。
-- **轮转：** [封卷路径](../rolling.go#L184-L230) 先 [Sync 再 Close 旧文件](../rolling.go#L352-L363)，rename 成功后、重开活动文件前[同步归档目录和活动文件的父目录](../rolling_maintenance.go#L163-L165)。目录同步失败交给[维护重试](../rolling_maintenance.go#L107-L125)，不直接作为触发轮转的 Write 错误返回；[目录同步助手](../rolling_recovery.go#L216-L229) 忽略 `EINVAL`/`ENOTSUP`，不能把这种返回视为目录确已落盘。
+- **异步写入：** [`AsyncWriter.Write`](../async.go) 对非空输入成功只表示已入队。[后台循环](../async.go) 会把无错误的短写转成 `io.ErrShortWrite` 并记住首个投递错误。[`Sync`](../async.go) 是 FIFO 屏障：处理此前已入队的记录后同步 sink，返回首个投递错误和本次同步错误（若有）；[`Close`](../async.go) 排空并关闭，合并投递和底层关闭错误，但不隐式 Sync。
+- **活动文件：** [`Writer.Write/Sync/Close`](../rolling.go) 分别转交文件 Write、仅同步当前活动文件、关闭活动文件并等待归档维护。Close 不同步活动文件，但会合并关闭错误和未解决的维护错误；活动文件的[创建路径](../rolling.go) 本身不显式同步父目录。
+- **轮转：** [封卷路径](../rolling.go) 先 [Sync 再 Close 旧文件](../rolling.go)，rename 成功后、重开活动文件前[同步归档目录和活动文件的父目录](../rolling_maintenance.go)。目录同步失败交给[维护重试](../rolling_maintenance.go)，不直接作为触发轮转的 Write 错误返回；[目录同步助手](../rolling_recovery.go) 忽略 `EINVAL`/`ENOTSUP`，不能把这种返回视为目录确已落盘。
 
 需要在正常停机前确认活动文件内容时：先停产，显式 Sync 并检查其结果，再 Close 并检查结果；这不能代替新建路径所需的目录同步，也不覆盖尚未入队或已丢弃的记录。

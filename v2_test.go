@@ -24,7 +24,11 @@ func TestV2OpenRotatesAndIgnoresOldArchives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	for _, p := range []string{string(make([]byte, 1<<20)), "def"} {
 		if _, err := w.Write([]byte(p)); err != nil {
 			t.Fatal(err)

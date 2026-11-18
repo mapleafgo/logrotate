@@ -9,12 +9,12 @@
 
 - [Writer](../rolling.go) 负责活动文件的追加、显式同步、封存和重开。
 - [归档维护](../rolling_maintenance.go) 串行调度[恢复与压缩](../rolling_recovery.go)和[保留清理](../rolling_retention.go)，独立于写入队列。
-- [AsyncWriter](../async.go) 独占底层 sink，提供并发入队、同步屏障和停机排空。关闭不隐式同步。
+- [AsyncWriter](../async.go) 独占底层 sink，使用有界 FIFO 队列，负责并发入队、同步屏障和停机排空。队列有空位才复制；底层写入返回后回收小缓冲，每个 writer 最多保留 64 个、每个不超过 4 KiB 的空闲缓冲区。关闭不隐式同步。
 
 ## 验证与调研
 
 - [验证记录](logback-rolling-acceptance.md)：历史测试、性能数据和候选验证状态。
-- [轮转机制对标](rotation-comparison.md)、[Logback 归档保留](logback-retention-reference.md)、[Logback 可靠性](logback-reliability-research.md)、[Go 文件可靠性](go-file-reliability-research.md)。
+- [轮转机制对标](rotation-comparison.md)、[Logback 归档保留](logback-retention-reference.md)、[Logback 可靠性](logback-reliability-research.md)、[Go 文件可靠性](go-file-reliability-research.md)、[Go 日志缓冲机制](go-logging-buffer-research.md)。
 
 ## 历史设计与计划
 

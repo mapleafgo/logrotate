@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -22,11 +23,31 @@ func TestRollingRejectsUnsafeActivePath(t *testing.T) {
 	for _, path := range []string{link, dir + string(os.PathSeparator) + ".." + string(os.PathSeparator) + filepath.Base(dir) + string(os.PathSeparator) + "target"} {
 		w, err := Open(Config{Filename: path})
 		if err == nil {
-			w.Close()
+			if err := w.Close(); err != nil {
+				t.Errorf("close unexpectedly opened %q: %v", path, err)
+			}
 			t.Errorf("accepted %s", path)
 		}
 	}
 }
+func TestRollingSealRenameErrorIncludesPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active.log")
+	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+	w := mustOpen(t, rollingConfig{Config: Config{Filename: path}, maxFileBytes: 3}, now)
+	w.rename = func(_, _ string) error { return syscall.ENOSPC }
+	writeRolling(t, w, "old")
+	n, err := w.Write([]byte("new"))
+	if n != 0 || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Write = %d, %v; want zero bytes and ENOSPC", n, err)
+	}
+	archive := filepath.Join(path+".archives", "2026-11-18.0")
+	for _, want := range []string{"seal active file", path, archive} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Write error %q does not include %q", err, want)
+		}
+	}
+}
+
 func TestRollingKeepsPrivateMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix permission bits")
@@ -56,7 +77,7 @@ func TestRollingPreservesOnlySealedVolumeUntilReopen(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "active")
 		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 		w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, HistoryDays: 2}, maxFileBytes: 3, totalArchiveBytes: 1}, now)
-		defer w.Close()
+		defer func() { _ = w.Close() }() // Fallback; the test checks the primary close result.
 		synctest.Wait()
 		if err := os.Mkdir(w.dir, 0755); err != nil {
 			t.Fatal(err)

@@ -67,15 +67,42 @@ type Writer struct {
 // subject to umask. Startup archive maintenance runs in the background.
 // Its errors are available via MaintenanceError and do not prevent writes.
 func Open(cfg Config) (*Writer, error) {
+	resolved, err := normalizeRollingConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return openRolling(resolved, time.Now)
+}
+
+func normalizeRollingConfig(cfg Config) (rollingConfig, error) {
 	const bytesPerMiB = 1 << 20
 	const maxMiB = math.MaxInt64 / bytesPerMiB
 	if cfg.MaxFileMiB < 0 || cfg.MaxFileMiB > maxMiB {
-		return nil, fmt.Errorf("logrotate: MaxFileMiB must be between 0 and %d", maxMiB)
+		return rollingConfig{}, fmt.Errorf("logrotate: MaxFileMiB must be between 0 and %d", maxMiB)
 	}
 	if cfg.TotalArchiveMiB < 0 || cfg.TotalArchiveMiB > maxMiB {
-		return nil, fmt.Errorf("logrotate: TotalArchiveMiB must be between 0 and %d", maxMiB)
+		return rollingConfig{}, fmt.Errorf("logrotate: TotalArchiveMiB must be between 0 and %d", maxMiB)
 	}
-	return openRolling(rollingConfig{Config: cfg, maxFileBytes: cfg.MaxFileMiB * bytesPerMiB, totalArchiveBytes: cfg.TotalArchiveMiB * bytesPerMiB}, time.Now)
+	switch {
+	case strings.TrimSpace(cfg.Filename) == "":
+		return rollingConfig{}, errors.New("logrotate: Filename is required")
+	case cfg.HistoryDays < 0:
+		return rollingConfig{}, errors.New("logrotate: HistoryDays must not be negative")
+	}
+	for _, component := range strings.FieldsFunc(cfg.Filename[len(filepath.VolumeName(cfg.Filename)):], func(r rune) bool { return r < 128 && os.IsPathSeparator(byte(r)) }) {
+		if component == ".." {
+			return rollingConfig{}, fmt.Errorf("logrotate: Filename must not contain parent components: %q", cfg.Filename)
+		}
+	}
+	if os.IsPathSeparator(cfg.Filename[len(cfg.Filename)-1]) {
+		return rollingConfig{}, fmt.Errorf("logrotate: Filename must name a file: %q", cfg.Filename)
+	}
+	cfg.Filename = filepath.Clean(cfg.Filename)
+	return rollingConfig{
+		Config:            cfg,
+		maxFileBytes:      cfg.MaxFileMiB * bytesPerMiB,
+		totalArchiveBytes: cfg.TotalArchiveMiB * bytesPerMiB,
+	}, nil
 }
 
 func openRolling(cfg rollingConfig, now func() time.Time) (*Writer, error) {
@@ -83,21 +110,6 @@ func openRolling(cfg rollingConfig, now func() time.Time) (*Writer, error) {
 }
 
 func openRollingWithCompressor(cfg rollingConfig, now func() time.Time, compress func(string, string) error) (*Writer, error) {
-	switch {
-	case strings.TrimSpace(cfg.Filename) == "":
-		return nil, errors.New("logrotate: Filename is required")
-	case cfg.HistoryDays < 0:
-		return nil, errors.New("logrotate: HistoryDays must not be negative")
-	}
-	for _, component := range strings.FieldsFunc(cfg.Filename[len(filepath.VolumeName(cfg.Filename)):], func(r rune) bool { return r < 128 && os.IsPathSeparator(byte(r)) }) {
-		if component == ".." {
-			return nil, fmt.Errorf("logrotate: Filename must not contain parent components: %q", cfg.Filename)
-		}
-	}
-	if os.IsPathSeparator(cfg.Filename[len(cfg.Filename)-1]) {
-		return nil, fmt.Errorf("logrotate: Filename must name a file: %q", cfg.Filename)
-	}
-	cfg.Filename = filepath.Clean(cfg.Filename)
 	w := &Writer{now: now, cfg: cfg, activeMode: 0600, dir: cfg.Filename + ".archives", rename: os.Rename, remove: os.Remove, compress: compress, archiveSync: syncRollingDir}
 	w.reopen = w.openRollingActive
 	if err := w.reopen(); err != nil {
@@ -109,22 +121,24 @@ func openRollingWithCompressor(cfg rollingConfig, now func() time.Time, compress
 }
 
 func (w *Writer) openRollingActive() error {
-	if _, err := rollingRegular(w.cfg.Filename); err != nil {
-		return err
+	path := w.cfg.Filename
+	if _, err := rollingRegular(path); err != nil {
+		return fmt.Errorf("logrotate: check active file %q: %w", path, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(w.cfg.Filename), 0755); err != nil {
-		return err
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return fmt.Errorf("logrotate: create active file directory %q: %w", parent, err)
 	}
-	f, err := os.OpenFile(w.cfg.Filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, w.activeMode)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, w.activeMode)
 	if err != nil {
-		return err
+		return fmt.Errorf("logrotate: open active file %q: %w", path, err)
 	}
 	info, err := f.Stat()
 	if err != nil {
-		return errors.Join(err, f.Close())
+		return errors.Join(fmt.Errorf("logrotate: stat active file %q: %w", path, err), closeRollingActive(f))
 	}
 	if !info.Mode().IsRegular() {
-		return errors.Join(fmt.Errorf("logrotate: active path %q is not a regular file", w.cfg.Filename), f.Close())
+		return errors.Join(fmt.Errorf("logrotate: active path %q is not a regular file", path), closeRollingActive(f))
 	}
 	w.file, w.size = f, info.Size()
 	w.activeMode = info.Mode().Perm()
@@ -153,7 +167,7 @@ func (w *Writer) setMaintenanceError(err error) {
 
 func (w *Writer) beforeRollingWrite(n int) error {
 	if w.file == nil {
-		if err := w.reopen(); err != nil {
+		if err := w.reopenActive(); err != nil {
 			return err
 		}
 		w.requestMaintenance(w.now().Local().Format(rollingDate))
@@ -177,6 +191,13 @@ func (w *Writer) beforeRollingWrite(n int) error {
 	return nil
 }
 
+func (w *Writer) reopenActive() error {
+	if err := w.reopen(); err != nil {
+		return fmt.Errorf("logrotate: reopen active file %q: %w", w.cfg.Filename, err)
+	}
+	return nil
+}
+
 func needsRolling(size, n, limit int64, laterDay bool) bool {
 	return size > 0 && (laterDay || (limit > 0 && n > limit-size))
 }
@@ -191,12 +212,12 @@ func (w *Writer) sealRolling(day, today string) error {
 	}
 	info, err := w.file.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("logrotate: stat active file %q before sealing: %w", w.cfg.Filename, err)
 	}
 	w.activeMode = info.Mode().Perm()
 	if err := w.prepareCloseForRotate(); err != nil {
 		if w.file == nil {
-			return errors.Join(err, w.reopen())
+			return errors.Join(err, w.reopenActive())
 		}
 		return err
 	}
@@ -209,7 +230,7 @@ func (w *Writer) sealRolling(day, today string) error {
 		if errors.Is(err, os.ErrExist) {
 			w.archiveDay = ""
 		}
-		return errors.Join(err, w.reopen())
+		return errors.Join(fmt.Errorf("logrotate: seal active file %q as %q: %w", w.cfg.Filename, target, err), w.reopenActive())
 	}
 	if w.archiveNext == ^uint64(0) {
 		w.archiveExhausted = true
@@ -221,7 +242,7 @@ func (w *Writer) sealRolling(day, today string) error {
 		w.day = today
 	}
 	syncErr := w.syncSealDirectories()
-	reopenErr := w.reopen()
+	reopenErr := w.reopenActive()
 	protected := ""
 	if reopenErr != nil {
 		protected = strings.TrimSuffix(filepath.Base(target), ".pending")
@@ -232,11 +253,11 @@ func (w *Writer) sealRolling(day, today string) error {
 
 func (w *Writer) ensureDirectory() error {
 	if err := os.Mkdir(w.dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-		return err
+		return fmt.Errorf("logrotate: create archive directory %q: %w", w.dir, err)
 	}
 	info, err := os.Lstat(w.dir)
 	if err != nil {
-		return err
+		return fmt.Errorf("logrotate: check archive directory %q: %w", w.dir, err)
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("logrotate: archive path %q is not a directory", w.dir)
@@ -255,7 +276,7 @@ func (w *Writer) nextArchive(day string) (string, error) {
 		w.archiveDay, w.archiveNext, w.archiveExhausted = day, next, false
 	}
 	if w.archiveExhausted {
-		return "", fmt.Errorf("logrotate: archive sequence exhausted for %s", day)
+		return "", fmt.Errorf("logrotate: archive sequence exhausted for %s in %q", day, w.dir)
 	}
 	return filepath.Join(w.dir, day+"."+strconv.FormatUint(w.archiveNext, 10)), nil
 }
@@ -268,14 +289,14 @@ func (w *Writer) scanArchiveSequence(day string) (uint64, error) {
 		var err error
 		entries, err = os.ReadDir(w.dir)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("logrotate: scan archive directory %q: %w", w.dir, err)
 		}
 		if _, _, after := w.reservedArchive(day); after != generation {
 			continue
 		}
 		if found {
 			if seq == ^uint64(0) {
-				return 0, fmt.Errorf("logrotate: archive sequence exhausted for %s", day)
+				return 0, fmt.Errorf("logrotate: archive sequence exhausted for %s in %q", day, w.dir)
 			}
 			next = seq + 1
 		}
@@ -285,7 +306,7 @@ func (w *Writer) scanArchiveSequence(day string) (uint64, error) {
 		d, i, _, ok := parseRollingArchive(e.Name())
 		if ok && d == day && i >= next {
 			if i == ^uint64(0) {
-				return 0, fmt.Errorf("logrotate: archive sequence exhausted for %s", day)
+				return 0, fmt.Errorf("logrotate: archive sequence exhausted for %s in %q", day, w.dir)
 			}
 			next = i + 1
 		}
@@ -322,7 +343,10 @@ func (w *Writer) Write(p []byte) (int, error) {
 	}
 	n, err := w.file.Write(p)
 	w.size += int64(n)
-	return n, err
+	if err != nil {
+		return n, fmt.Errorf("logrotate: write active file %q: %w", w.cfg.Filename, err)
+	}
+	return n, nil
 }
 
 // Sync flushes the active file. It returns os.ErrClosed if no file is open.
@@ -330,7 +354,10 @@ func (w *Writer) Sync() error {
 	if w.file == nil {
 		return os.ErrClosed
 	}
-	return w.file.Sync()
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("logrotate: sync active file %q: %w", w.cfg.Filename, err)
+	}
+	return nil
 }
 
 // Close closes the active file without syncing it, then waits for scheduled
@@ -350,14 +377,21 @@ func (w *Writer) Close() error {
 }
 
 func (w *Writer) prepareCloseForRotate() error {
-	if err := w.file.Sync(); err != nil {
+	if err := w.Sync(); err != nil {
 		return err
 	}
 	return w.closeFile()
 }
 
 func (w *Writer) closeFile() error {
-	err := w.file.Close()
+	err := closeRollingActive(w.file)
 	w.file = nil
 	return err
+}
+
+func closeRollingActive(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("logrotate: close active file %q: %w", f.Name(), err)
+	}
+	return nil
 }

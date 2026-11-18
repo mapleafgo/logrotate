@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -111,50 +111,54 @@ func TestAsyncWriterDrainsOnClose(t *testing.T) {
 }
 
 func TestAsyncWriterBlockWhenFull(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "app.log")
-	base, err := Open(Config{Filename: path})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	gate := make(chan struct{})
-	slow := &blockingWriter{w: base, gate: gate, blockFirst: 1}
-	aw, err := OpenAsync(slow, AsyncConfig{QueueSize: 2, FullPolicy: FullBlock})
-	if err != nil {
-		t.Fatalf("OpenAsync: %v", err)
-	}
-	if _, err := aw.Write([]byte("a\n")); err != nil {
-		t.Fatalf("write a: %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	if _, err := aw.Write([]byte("b\n")); err != nil {
-		t.Fatalf("write b: %v", err)
-	}
-	if _, err := aw.Write([]byte("c\n")); err != nil {
-		t.Fatalf("write c: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := aw.Write([]byte("d\n"))
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		t.Fatalf("Write should block: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(gate)
-	select {
-	case err := <-done:
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "app.log")
+		base, err := Open(Config{Filename: path})
 		if err != nil {
-			t.Fatalf("blocked write: %v", err)
+			t.Fatalf("Open: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("blocked write did not complete")
-	}
-	if err := aw.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+		gate := make(chan struct{})
+		entered := make(chan struct{})
+		slow := &blockingWriter{w: base, gate: gate, entered: entered}
+		aw, err := OpenAsync(slow, AsyncConfig{QueueSize: 2, FullPolicy: FullBlock})
+		if err != nil {
+			t.Fatalf("OpenAsync: %v", err)
+		}
+		if _, err := aw.Write([]byte("a\n")); err != nil {
+			t.Fatalf("write a: %v", err)
+		}
+		<-entered
+		if _, err := aw.Write([]byte("b\n")); err != nil {
+			t.Fatalf("write b: %v", err)
+		}
+		if _, err := aw.Write([]byte("c\n")); err != nil {
+			t.Fatalf("write c: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := aw.Write([]byte("d\n"))
+			done <- err
+		}()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Write should block: %v", err)
+		default:
+		}
+		close(gate)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("blocked write: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("blocked write did not complete")
+		}
+		if err := aw.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
 }
 
 func TestAsyncWriterDropNewest(t *testing.T) {
@@ -165,7 +169,8 @@ func TestAsyncWriterDropNewest(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	gate := make(chan struct{})
-	slow := &blockingWriter{w: base, gate: gate, blockFirst: 1}
+	entered := make(chan struct{})
+	slow := &blockingWriter{w: base, gate: gate, entered: entered}
 	aw, err := OpenAsync(slow, AsyncConfig{QueueSize: 1, FullPolicy: FullDropNewest})
 	if err != nil {
 		t.Fatalf("OpenAsync: %v", err)
@@ -173,7 +178,7 @@ func TestAsyncWriterDropNewest(t *testing.T) {
 	if _, err := aw.Write([]byte("keep\n")); err != nil {
 		t.Fatalf("write keep: %v", err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	<-entered
 	// 填满队列
 	if _, err := aw.Write([]byte("queued\n")); err != nil {
 		t.Fatalf("write queued: %v", err)
@@ -286,14 +291,15 @@ func TestAsyncSyncSerialWithWrites(t *testing.T) {
 }
 
 type blockingWriter struct {
-	w          *Writer
-	gate       <-chan struct{}
-	blockFirst int
-	seen       atomic.Int32
+	w       *Writer
+	gate    <-chan struct{}
+	entered chan struct{}
 }
 
 func (b *blockingWriter) Write(p []byte) (int, error) {
-	if int(b.seen.Add(1)) <= b.blockFirst {
+	if b.entered != nil {
+		close(b.entered)
+		b.entered = nil
 		<-b.gate
 	}
 	return b.w.Write(p)

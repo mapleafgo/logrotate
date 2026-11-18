@@ -141,7 +141,9 @@ func TestRollingMaintenanceDoesNotBlockWrites(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("Write or Sync waited for archive compression")
 		release <- struct{}{}
-		<-result
+		if err := <-result; err != nil {
+			t.Error(err)
+		}
 		return
 	}
 	if _, err := os.Stat(path + ".archives/2026-11-18.2.pending"); err != nil {
@@ -160,7 +162,11 @@ func TestRollingSameDaySequenceSurvivesRetention(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "active")
 	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 	w := mustOpen(t, rollingConfig{Config: Config{Filename: path}, maxFileBytes: 3, totalArchiveBytes: 1}, now)
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	removed := make(chan struct{}, 2)
 	w.remove = func(name string) error {
 		if err := os.Remove(name); err != nil {

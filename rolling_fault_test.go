@@ -24,7 +24,7 @@ func TestRollingRetriesENOSPCAfterRetention(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "active")
 				now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 				w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, HistoryDays: tc.history}, maxFileBytes: 3}, now)
-				defer w.Close()
+				defer func() { _ = w.Close() }() // Fallback; the test checks the primary close result.
 				synctest.Wait()
 				if err := os.Mkdir(w.dir, 0755); err != nil {
 					t.Fatal(err)
@@ -74,7 +74,7 @@ func TestRollingRetriesPostUnlinkDirectorySync(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "active")
 		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 		w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true}, maxFileBytes: 3}, now)
-		defer w.Close()
+		defer func() { _ = w.Close() }() // Fallback; the test checks the primary close result.
 		synctest.Wait()
 		fail := true
 		calls := 0

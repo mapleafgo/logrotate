@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"reflect"
 	"sync"
 	"sync/atomic"
 )
@@ -37,7 +38,9 @@ type AsyncConfig struct {
 	FullPolicy FullPolicy
 }
 
-// FileSink 是异步层底层的文件写入抽象。*Writer 已实现；测试可注入包装类型。
+// FileSink 是 AsyncWriter 独占的底层写入目标，各方法由异步层串行调用。
+// Write 遵守 io.Writer 契约；短写且无错误时按 io.ErrShortWrite 处理。
+// Close 在已接收的数据交付后调用，不会隐式调用 Sync。
 type FileSink interface {
 	Write(p []byte) (int, error)
 	Sync() error
@@ -45,17 +48,22 @@ type FileSink interface {
 }
 
 // AsyncWriter 在单刷盘 goroutine 上串行写底层，调用方 Write 只入队。
-// Close 会拒绝新写入、等待在途 Write、排空队列并关闭底层，不隐式调用 Sync。
+// Close 会拒绝新写入、唤醒等待入队的调用、排空队列并关闭底层，不隐式调用 Sync。
 // 停机请先停止业务写日志，再 Close，以保证“写完再退”。
 // Write 成功仅表示入队；需要确认持久化时，请显式调用并检查 Sync。
 type AsyncWriter struct {
-	sink    FileSink
-	ch      chan asyncMsg
-	closeCh chan struct{} // Close 时先关闭，解除阻塞中的 Write
-	policy  FullPolicy
+	sink   FileSink
+	policy FullPolicy
 
-	admission sync.Mutex
-	senders   sync.WaitGroup // 已准入、可能发送到 ch 的调用
+	queueMu  sync.Mutex
+	readable *sync.Cond
+	writable *sync.Cond
+	queue    []asyncMsg
+	head     int
+	count    int
+	spare    [][]byte // guarded by queueMu
+	closed   bool
+
 	loopWG    sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
@@ -76,29 +84,52 @@ type asyncMsg struct {
 // OpenAsync 启动后台刷盘。sink 不可为 nil，且成功后由 AsyncWriter 独占并关闭。
 // Write 会拷贝 p，调用方可复用缓冲区。
 func OpenAsync(sink FileSink, cfg AsyncConfig) (*AsyncWriter, error) {
-	if sink == nil {
+	if nilSink(sink) {
 		return nil, errors.New("logrotate: async sink is nil")
 	}
-	if cfg.FullPolicy != FullBlock && cfg.FullPolicy != FullDropNewest {
-		return nil, fmt.Errorf("logrotate: invalid async queue full policy %d", cfg.FullPolicy)
+	cfg, err := resolveAsyncConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.QueueSize <= 0 {
-		cfg.QueueSize = defaultQueueSize
-	}
-	aw := &AsyncWriter{
-		sink:    sink,
-		ch:      make(chan asyncMsg, cfg.QueueSize),
-		closeCh: make(chan struct{}),
-		policy:  cfg.FullPolicy,
-	}
+	aw := &AsyncWriter{sink: sink, policy: cfg.FullPolicy, queue: make([]asyncMsg, cfg.QueueSize)}
+	aw.readable = sync.NewCond(&aw.queueMu)
+	aw.writable = sync.NewCond(&aw.queueMu)
 	aw.loopWG.Add(1)
 	go aw.loop()
 	return aw, nil
 }
 
+func nilSink(sink FileSink) bool {
+	v := reflect.ValueOf(sink)
+	switch v.Kind() {
+	case reflect.Invalid:
+		return true
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+func resolveAsyncConfig(cfg AsyncConfig) (AsyncConfig, error) {
+	if cfg.FullPolicy != FullBlock && cfg.FullPolicy != FullDropNewest {
+		return AsyncConfig{}, fmt.Errorf("logrotate: invalid async queue full policy %d", cfg.FullPolicy)
+	}
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = defaultQueueSize
+	}
+	return cfg, nil
+}
+
 func (aw *AsyncWriter) loop() {
 	defer aw.loopWG.Done()
-	for msg := range aw.ch {
+	var delivered []byte
+	for {
+		msg, ok := aw.dequeue(delivered)
+		delivered = nil
+		if !ok {
+			return
+		}
 		if msg.syncDone != nil {
 			err := aw.sink.Sync()
 			aw.setLastError(err)
@@ -111,6 +142,7 @@ func (aw *AsyncWriter) loop() {
 			continue
 		}
 		n, err := aw.sink.Write(msg.data)
+		delivered = msg.data
 		if err == nil && n != len(msg.data) {
 			err = io.ErrShortWrite
 		}
@@ -127,48 +159,85 @@ func (aw *AsyncWriter) setLastError(err error) {
 	aw.errMu.Unlock()
 }
 
-// admit registers a sender before Close can seal admission and wait.
-func (aw *AsyncWriter) admit() bool {
-	aw.admission.Lock()
-	defer aw.admission.Unlock()
-	select {
-	case <-aw.closeCh:
-		return false
-	default:
-		aw.senders.Add(1)
-		return true
+func (aw *AsyncWriter) enqueue(msg asyncMsg, drop bool) error {
+	aw.queueMu.Lock()
+	defer aw.queueMu.Unlock()
+	for !aw.closed && aw.count == len(aw.queue) {
+		if drop {
+			aw.dropped.Add(1)
+			return ErrDropped
+		}
+		aw.writable.Wait()
 	}
+	if aw.closed {
+		return ErrClosed
+	}
+	// Copy only after admission; the caller may reuse its input after Write.
+	msg.data = aw.copyRecord(msg.data)
+	aw.queue[(aw.head+aw.count)%len(aw.queue)] = msg
+	aw.count++
+	aw.readable.Signal()
+	return nil
+}
+
+// Cap idle retention at 256 KiB per writer, even with a large queue.
+const (
+	maxSpareRecordBytes = 4 << 10
+	maxSpareRecords     = 64
+)
+
+// copyRecord is called with queueMu held.
+func (aw *AsyncWriter) copyRecord(p []byte) []byte {
+	if len(p) == 0 || len(p) > maxSpareRecordBytes || len(aw.spare) == 0 {
+		return bytes.Clone(p)
+	}
+	i := len(aw.spare) - 1
+	buf := aw.spare[i]
+	if cap(buf) < len(p) {
+		return bytes.Clone(p)
+	}
+	aw.spare[i] = nil
+	aw.spare = aw.spare[:i]
+	return append(buf[:0], p...)
+}
+
+func (aw *AsyncWriter) dequeue(delivered []byte) (asyncMsg, bool) {
+	aw.queueMu.Lock()
+	defer aw.queueMu.Unlock()
+	// Reclaim only after the sink returns, with no extra lock acquisition.
+	if cap(delivered) > 0 && cap(delivered) <= maxSpareRecordBytes && len(aw.spare) < min(len(aw.queue), maxSpareRecords) {
+		aw.spare = append(aw.spare, delivered[:0])
+	}
+	for aw.count == 0 && !aw.closed {
+		aw.readable.Wait()
+	}
+	if aw.count == 0 {
+		aw.spare = nil
+		return asyncMsg{}, false
+	}
+	msg := aw.queue[aw.head]
+	aw.queue[aw.head] = asyncMsg{}
+	aw.head = (aw.head + 1) % len(aw.queue)
+	aw.count--
+	aw.writable.Signal()
+	return msg, true
 }
 
 // Write 将日志入队。默认队列满时阻塞；FullDropNewest 时可能返回 ErrDropped。
-// 停止接收后返回 ErrClosed。会拷贝 p。并发安全。
+// 停止接收后返回 ErrClosed。成功入队时拷贝 p。并发安全。
 func (aw *AsyncWriter) Write(p []byte) (int, error) {
-	if !aw.admit() {
-		return 0, ErrClosed
-	}
-	defer aw.senders.Done()
 	if len(p) == 0 {
+		aw.queueMu.Lock()
+		defer aw.queueMu.Unlock()
+		if aw.closed {
+			return 0, ErrClosed
+		}
 		return 0, nil
 	}
-	msg := asyncMsg{data: bytes.Clone(p)}
-	if aw.policy == FullDropNewest {
-		select {
-		case <-aw.closeCh:
-			return 0, ErrClosed
-		case aw.ch <- msg:
-			return len(p), nil
-		default:
-			aw.dropped.Add(1)
-			return 0, ErrDropped
-		}
+	if err := aw.enqueue(asyncMsg{data: p}, aw.policy == FullDropNewest); err != nil {
+		return 0, err
 	}
-
-	select {
-	case <-aw.closeCh:
-		return 0, ErrClosed
-	case aw.ch <- msg:
-		return len(p), nil
-	}
+	return len(p), nil
 }
 
 // Dropped 返回因 FullDropNewest 丢弃的条数。
@@ -187,18 +256,11 @@ func (aw *AsyncWriter) LastError() error {
 // Sync 在队列中放入 FIFO 屏障；先前已入队的记录写完后同步底层。
 // 返回首个后台写入错误及本次同步错误（若有）。停止接收后返回 ErrClosed。并发安全。
 func (aw *AsyncWriter) Sync() error {
-	if !aw.admit() {
-		return ErrClosed
-	}
 	done := make(chan error, 1)
-	select {
-	case <-aw.closeCh:
-		aw.senders.Done()
-		return ErrClosed
-	case aw.ch <- asyncMsg{syncDone: done}:
-		aw.senders.Done()
-		return <-done
+	if err := aw.enqueue(asyncMsg{syncDone: done}, false); err != nil {
+		return err
 	}
+	return <-done
 }
 
 // Close 停止接收、唤醒等待入队的调用、排空队列并关闭底层。
@@ -206,11 +268,11 @@ func (aw *AsyncWriter) Sync() error {
 // 重复调用返回同一结果。
 func (aw *AsyncWriter) Close() error {
 	aw.closeOnce.Do(func() {
-		aw.admission.Lock()
-		close(aw.closeCh)
-		aw.admission.Unlock()
-		aw.senders.Wait()
-		close(aw.ch)
+		aw.queueMu.Lock()
+		aw.closed = true
+		aw.readable.Signal()
+		aw.writable.Broadcast()
+		aw.queueMu.Unlock()
 		aw.loopWG.Wait()
 
 		aw.closeErr = errors.Join(aw.deliveryErr, aw.sink.Close())

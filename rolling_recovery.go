@@ -162,7 +162,7 @@ func writeRollingCompressed(source, temp string) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }() // Read-only cleanup; read errors are checked separately.
 	info, err := src.Stat()
 	if err != nil {
 		return err
@@ -185,17 +185,17 @@ func verifyRollingGzip(source, final string) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }() // Read-only cleanup; read errors are checked separately.
 	dst, err := os.Open(final)
 	if err != nil {
 		return err
 	}
-	defer dst.Close()
+	defer func() { _ = dst.Close() }() // Read-only cleanup; read errors are checked separately.
 	gz, err := gzip.NewReader(dst)
 	if err != nil {
 		return err
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }() // Read-only cleanup; read errors are checked separately.
 	plainDigest, gzipDigest := sha256.New(), sha256.New()
 	plainSize, err := io.Copy(plainDigest, src)
 	if err != nil {

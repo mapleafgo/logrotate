@@ -9,10 +9,10 @@
 
 ## 安装
 
-需要 **Go 1.26 或更高版本**；支持 Linux、macOS 和 Windows。v2 目前为[预发行版](https://github.com/mapleafgo/logrotate/releases/tag/v2.0.0-rc.2)，使用时请指定版本：
+需要 **Go 1.26 或更高版本**。v2 目前为预发行版，使用时请指定已发布的版本：
 
 ```sh
-go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.2
+go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.3
 ```
 
 ## 快速开始
@@ -70,7 +70,7 @@ func main() {
 ## 并发、同步与退出
 
 - **单 goroutine 写入**：直接使用 `Open` 返回的 `Writer`。并发写入时用 `OpenAsync(w, AsyncConfig{})` 包装；包装成功后由异步 writer 独占并关闭底层。活动文件和归档目录不得与其他 writer 或外部轮转工具共用。
-- **异步队列**：默认 1024 条，队列满时阻塞。显式选择 `FullDropNewest` 时，满队列拒收当前记录并返回 `ErrDropped`。异步 `Write` 成功只表示已入队；`LastError()` 提供最近一次后台写入或同步结果。
+- **异步队列**：`AsyncConfig.QueueSize` 按写入条数而非字节计，非正数使用默认值 1024。默认队列满时阻塞。显式选择 `FullDropNewest` 时，满队列拒收当前记录并返回 `ErrDropped`。异步 `Write` 成功只表示已入队；返回后可复用传入的缓冲区。`LastError()` 提供最近一次后台写入或同步结果。
 - **显式同步**：异步 `Sync()` 等待屏障前已入队的记录交付，再同步底层。`Writer.Sync()` 只同步当前活动文件，不保证新建路径的目录项持久化，也不等待归档维护。
 - **正常退出**：先停止日志生产者；需要确认持久化时，显式调用并检查 `Sync()`。无论同步是否成功都应调用并检查 `Close()`。关闭会排空已接收的异步记录并等待归档维护收尾，不隐式同步、不设超时。首个后台写入错误仍会由后续 `Sync()` 和 `Close()` 返回。
 

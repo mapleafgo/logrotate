@@ -106,12 +106,12 @@ func assertRollingGzip(t *testing.T, path, want string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // Read-only cleanup; read errors are checked separately.
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }() // Read-only cleanup; read errors are checked separately.
 	data, err := io.ReadAll(gz)
 	if err != nil || string(data) != want {
 		t.Fatalf("%s = %q, %v; want %q", path, data, err, want)
