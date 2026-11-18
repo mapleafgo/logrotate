@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -41,7 +42,7 @@ func TestRollingSealRenameErrorIncludesPaths(t *testing.T) {
 		t.Fatalf("Write = %d, %v; want zero bytes and ENOSPC", n, err)
 	}
 	archive := filepath.Join(path+".archives", "2026-11-18.0")
-	for _, want := range []string{"seal active file", path, archive} {
+	for _, want := range []string{"seal active file", strconv.Quote(path), strconv.Quote(archive)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Write error %q does not include %q", err, want)
 		}

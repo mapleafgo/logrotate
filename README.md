@@ -12,7 +12,7 @@
 需要 **Go 1.26 或更高版本**。v2 目前为预发行版，使用时请指定已发布的版本：
 
 ```sh
-go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.3
+go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.4
 ```
 
 ## 快速开始
