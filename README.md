@@ -9,10 +9,10 @@
 
 ## 安装
 
-需要 **Go 1.26 或更高版本**；支持 Linux、macOS 和 Windows。v2 目前为[预发行版](https://github.com/mapleafgo/logrotate/releases/tag/v2.0.0-rc.1)，使用时请指定版本：
+需要 **Go 1.26 或更高版本**；支持 Linux、macOS 和 Windows。v2 目前为[预发行版](https://github.com/mapleafgo/logrotate/releases/tag/v2.0.0-rc.2)，使用时请指定版本：
 
 ```sh
-go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.1
+go get github.com/mapleafgo/logrotate/v2@v2.0.0-rc.2
 ```
 
 ## 快速开始
@@ -105,3 +105,7 @@ func main() {
 - [Go API 参考](https://pkg.go.dev/github.com/mapleafgo/logrotate/v2)
 - [发布记录](https://github.com/mapleafgo/logrotate/releases)
 - [项目文档索引](docs/README.md)
+
+## 许可证
+
+代码采用 [MIT License](LICENSE)。Logo 参考了 [Renée French 创作的 Go Gopher](https://go.dev/blog/gopher)，其原始形象采用 CC BY 4.0。
