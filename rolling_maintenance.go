@@ -3,6 +3,7 @@ package logrotate
 import (
 	"errors"
 	"path/filepath"
+	"time"
 )
 
 // All state except the channels is guarded by Writer.mu. No filesystem
@@ -32,9 +33,6 @@ func (w *Writer) requestMaintenance(day string) {
 
 func (w *Writer) requestMaintenanceAfterSeal(day, protected string, sealed bool, syncErr error) {
 	m := &w.maintenance
-	if m.wake == nil {
-		return
-	}
 	w.mu.Lock()
 	if sealed {
 		m.sealing = ""
@@ -56,8 +54,42 @@ func (w *Writer) maintenanceLoop() {
 	m := &w.maintenance
 	defer close(m.done)
 	var unlinkSyncErr error
-	for range m.wake {
-		w.setMaintenanceError(w.maintainSnapshot(&unlinkSyncErr))
+	const initialDelay = time.Second
+	const maxRetries = 3
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	var retry <-chan time.Time
+	attempt := 0
+	for {
+		select {
+		case _, ok := <-m.wake:
+			if !ok {
+				return
+			}
+			attempt = 0
+			if retry != nil {
+				timer.Stop()
+				retry = nil
+			}
+		case <-retry:
+			retry = nil
+		}
+		err := w.maintainSnapshot(&unlinkSyncErr)
+		w.setMaintenanceError(err)
+		if err != nil && attempt < maxRetries {
+			delay := initialDelay << attempt
+			attempt++
+			if timer == nil {
+				timer = time.NewTimer(delay)
+			} else {
+				timer.Reset(delay)
+			}
+			retry = timer.C
+		}
 	}
 }
 
@@ -142,8 +174,6 @@ func (w *Writer) reservedArchive(day string) (uint64, bool, uint64) {
 
 func (w *Writer) drainMaintenance() {
 	m := &w.maintenance
-	if m.wake != nil {
-		close(m.wake)
-		<-m.done
-	}
+	close(m.wake)
+	<-m.done
 }

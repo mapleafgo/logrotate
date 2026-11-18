@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	legacy "github.com/mapleafgo/logrotate"
 	current "github.com/mapleafgo/logrotate/v2"
@@ -37,7 +36,7 @@ func TestReleaseMigrationAndRollback(t *testing.T) {
 	assertContent(t, oldArchive, gunzip(t, oldArchive, oldGzip), legacyHistory)
 
 	v2 := opened(t, current.Open, current.Config{
-		Filename: path, MaxFileMiB: 1, Location: time.UTC, Compress: true, HistoryDays: 7,
+		Filename: path, MaxFileMiB: 1, Compress: true, HistoryDays: 7,
 	})
 	write(t, v2, upgradeMarker)
 	assertContent(t, path, readFile(t, path), legacyActive+upgradeMarker)

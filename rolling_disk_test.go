@@ -35,8 +35,8 @@ func TestRollingKeepsPrivateMode(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, Location: time.UTC}, maxFileBytes: 3}, now)
+	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true}, maxFileBytes: 3}, now)
 	writeRolling(t, w, "new")
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -54,8 +54,8 @@ func TestRollingKeepsPrivateMode(t *testing.T) {
 func TestRollingPreservesOnlySealedVolumeUntilReopen(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "active")
-		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-		w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, Location: time.UTC, HistoryDays: 2}, maxFileBytes: 3, totalArchiveBytes: 1}, now)
+		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+		w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, HistoryDays: 2}, maxFileBytes: 3, totalArchiveBytes: 1}, now)
 		defer w.Close()
 		synctest.Wait()
 		if err := os.Mkdir(w.dir, 0755); err != nil {

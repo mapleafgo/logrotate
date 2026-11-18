@@ -24,7 +24,6 @@ func rollingRetentionPlan(archives []rollingArchive, day string, history int) (e
 		}
 		return a.seq < b.seq
 	})
-	cutoff := day
 	if history == 0 {
 		return nil, archives
 	}
@@ -35,7 +34,7 @@ func rollingRetentionPlan(archives []rollingArchive, day string, history int) (e
 		stamp, _ := time.Parse(rollingDate, a.day)
 		// Canonical names have four-digit years; bounded differences fit int.
 		age := int((current.Unix() - stamp.Unix()) / 86400)
-		if age < history || a.day >= cutoff {
+		if age < history {
 			return archives[:i], archives[i:]
 		}
 	}
@@ -119,7 +118,7 @@ func (s *archiveMaintenance) applyRetention(entries []os.DirEntry, day, protecte
 		total -= uint64(a.size)
 	}
 	if undeletable > cap {
-		result = errors.Join(result, fmt.Errorf("logrotate: archive cap of %d bytes is unreachable: %d bytes cannot be removed from %s", cap, undeletable, s.dir))
+		result = errors.Join(result, fmt.Errorf("logrotate: archive cap of %d bytes is unreachable: %d bytes cannot be removed from %q", cap, undeletable, s.dir))
 	}
 	return removed, result
 }

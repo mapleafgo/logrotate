@@ -22,7 +22,7 @@ func BenchmarkRolling(b *testing.B) {
 		{"ordinary", 0}, {"roll-every-write", 1024},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			w, err := openRolling(rollingConfig{Config: Config{Filename: filepath.Join(b.TempDir(), "app.log"), Compress: true, Location: time.UTC}, maxFileBytes: tc.limit, totalArchiveBytes: 64 << 10}, time.Now)
+			w, err := openRolling(rollingConfig{Config: Config{Filename: filepath.Join(b.TempDir(), "app.log"), Compress: true}, maxFileBytes: tc.limit, totalArchiveBytes: 64 << 10}, time.Now)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -79,7 +79,7 @@ func benchmarkRollingPaced(b *testing.B, history int) {
 	b.SetBytes(int64(len(payload) * writesPerBurst))
 	b.ReportAllocs()
 	b.ResetTimer()
-	w, err := openRolling(rollingConfig{Config: Config{Filename: filename, Compress: true, Location: time.UTC}, maxFileBytes: int64(len(payload) * writesPerArchive), totalArchiveBytes: budget}, time.Now)
+	w, err := openRolling(rollingConfig{Config: Config{Filename: filename, Compress: true}, maxFileBytes: int64(len(payload) * writesPerArchive), totalArchiveBytes: budget}, time.Now)
 	if err != nil {
 		b.Fatal(err)
 	}

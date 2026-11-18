@@ -3,10 +3,17 @@ package logrotate_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/mapleafgo/logrotate/v2"
 )
+
+func TestConfigUsesProcessTimezoneOnly(t *testing.T) {
+	if _, exists := reflect.TypeFor[logrotate.Config]().FieldByName("Location"); exists {
+		t.Fatal("Config must not expose a timezone override")
+	}
+}
 
 func TestV2OpenRotatesAndIgnoresOldArchives(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")

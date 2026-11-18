@@ -22,8 +22,8 @@ func TestRollingRetriesENOSPCAfterRetention(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "active")
-				now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-				w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Location: time.UTC, Compress: true, HistoryDays: tc.history}, maxFileBytes: 3}, now)
+				now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+				w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, HistoryDays: tc.history}, maxFileBytes: 3}, now)
 				defer w.Close()
 				synctest.Wait()
 				if err := os.Mkdir(w.dir, 0755); err != nil {
@@ -72,8 +72,8 @@ func TestRollingRetriesENOSPCAfterRetention(t *testing.T) {
 func TestRollingRetriesPostUnlinkDirectorySync(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "active")
-		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-		w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, Location: time.UTC}, maxFileBytes: 3}, now)
+		now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+		w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true}, maxFileBytes: 3}, now)
 		defer w.Close()
 		synctest.Wait()
 		fail := true
@@ -113,8 +113,8 @@ func TestRollingRecoveryAfterFailure(t *testing.T) {
 		t.Run(step, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "app.log")
 			base := path + ".archives/2026-11-18.0"
-			cfg := rollingConfig{Config: Config{Filename: path, Location: time.UTC, Compress: true}, maxFileBytes: 4}
-			now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
+			cfg := rollingConfig{Config: Config{Filename: path, Compress: true}, maxFileBytes: 4}
+			now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 			w := mustOpen(t, cfg, now)
 			w.rename = func(src, dst string) error {
 				if (step == "seal" && src == path) || (step == "publish" && strings.HasSuffix(dst, ".gz")) {
@@ -161,6 +161,9 @@ func TestRollingRecoveryAfterFailure(t *testing.T) {
 			}
 			if !writeFailed {
 				assertRollingContents(t, base+".pending", "ID01")
+			}
+			if step == "compress" || step == "publish" {
+				assertRollingAbsent(t, base+".tmp")
 			}
 			if step == "reopen" {
 				assertRollingGzip(t, base+".gz", "ID01")

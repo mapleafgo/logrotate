@@ -9,8 +9,8 @@ import (
 
 func TestRollingSizeAndRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")
-	cfg := rollingConfig{Config: Config{Filename: path, Location: time.UTC}, maxFileBytes: 4}
-	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
+	cfg := rollingConfig{Config: Config{Filename: path}, maxFileBytes: 4}
+	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 	w := mustOpen(t, cfg, now)
 	writeRolling(t, w, "abc")
 	writeRolling(t, w, "d")

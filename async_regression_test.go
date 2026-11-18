@@ -87,7 +87,7 @@ func TestAsyncRegressionRetainsFirstDeliveryError(t *testing.T) {
 			if again := aw.Close(); again != first {
 				t.Errorf("second Close = %v, want same result %v", again, first)
 			}
-			if want := []string{"first", "second", "ok", "sync", "sync", "close"}; !reflect.DeepEqual(events, want) {
+			if want := []string{"first", "second", "ok", "sync", "close"}; !reflect.DeepEqual(events, want) {
 				t.Errorf("sink events = %q, want %q", events, want)
 			}
 		})

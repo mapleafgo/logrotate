@@ -8,6 +8,40 @@ import (
 	"time"
 )
 
+func TestRollingRetriesMaintenanceWithoutAnotherWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "active")
+		base := filepath.Join(path+".archives", "2026-11-18.0")
+		if err := os.Mkdir(filepath.Dir(base), 0755); err != nil {
+			t.Fatal(err)
+		}
+		writeRollingFixture(t, base+".pending", "sealed")
+		attempts := 0
+		w, err := openRollingWithCompressor(rollingConfig{Config: Config{Filename: path}}, time.Now, func(src, tmp string) error {
+			attempts++
+			if attempts == 1 {
+				return os.ErrDeadlineExceeded
+			}
+			return writeRollingCompressed(src, tmp)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.Close() }()
+		synctest.Wait()
+		if w.MaintenanceError() == nil {
+			t.Fatal("initial failure was not reported")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if attempts != 2 || w.MaintenanceError() != nil {
+			t.Fatalf("attempts = %d, maintenance error = %v", attempts, w.MaintenanceError())
+		}
+		assertRollingGzip(t, base+".gz", "sealed")
+		assertRollingAbsent(t, base+".pending")
+	})
+}
+
 func TestRollingStartupDoesNotBlockOpenAndCloseWaits(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "active")
@@ -24,8 +58,8 @@ func TestRollingStartupDoesNotBlockOpenAndCloseWaits(t *testing.T) {
 		}
 		opened := make(chan openResult, 1)
 		go func() {
-			now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-			w, err := openRollingWithCompressor(rollingConfig{Config: Config{Filename: path, Location: time.UTC, Compress: true}}, now, func(src, tmp string) error {
+			now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+			w, err := openRollingWithCompressor(rollingConfig{Config: Config{Filename: path, Compress: true}}, now, func(src, tmp string) error {
 				close(entered)
 				<-release
 				return writeRollingCompressed(src, tmp)
@@ -72,8 +106,8 @@ func TestRollingStartupDoesNotBlockOpenAndCloseWaits(t *testing.T) {
 
 func TestRollingMaintenanceDoesNotBlockWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "active")
-	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true, Location: time.UTC}, maxFileBytes: 3}, now)
+	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Compress: true}, maxFileBytes: 3}, now)
 	entered, release := make(chan struct{}), make(chan struct{})
 	defer func() { close(release); _ = w.Close() }()
 	w.compress = func(source, temp string) error {
@@ -124,8 +158,8 @@ func TestRollingMaintenanceDoesNotBlockWrites(t *testing.T) {
 
 func TestRollingSameDaySequenceSurvivesRetention(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "active")
-	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC) }
-	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Location: time.UTC}, maxFileBytes: 3, totalArchiveBytes: 1}, now)
+	now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
+	w := mustOpen(t, rollingConfig{Config: Config{Filename: path}, maxFileBytes: 3, totalArchiveBytes: 1}, now)
 	defer w.Close()
 	removed := make(chan struct{}, 2)
 	w.remove = func(name string) error {

@@ -11,10 +11,10 @@ import (
 )
 
 // ErrDropped 表示异步队列已满且策略为 FullDropNewest，当前写入被丢弃。
-var ErrDropped = errors.New("logrotate: 异步队列已满，已丢弃本条日志")
+var ErrDropped = errors.New("logrotate: async queue is full; record dropped")
 
 // ErrClosed 表示异步写入器已停止接收；也可用 errors.Is 匹配 fs.ErrClosed。
-var ErrClosed = fmt.Errorf("logrotate: 异步日志已关闭: %w", fs.ErrClosed)
+var ErrClosed = fmt.Errorf("logrotate: async writer is closed: %w", fs.ErrClosed)
 
 // FullPolicy 异步队列满时的行为。
 type FullPolicy int
@@ -45,9 +45,9 @@ type FileSink interface {
 }
 
 // AsyncWriter 在单刷盘 goroutine 上串行写底层，调用方 Write 只入队。
-// Close 会拒绝新写入、等待在途 Write、排空队列、Sync 再 Close 底层。
+// Close 会拒绝新写入、等待在途 Write、排空队列并关闭底层，不隐式调用 Sync。
 // 停机请先停止业务写日志，再 Close，以保证“写完再退”。
-// Write 成功仅表示入队；刷盘错误见 LastError 与 Close。
+// Write 成功仅表示入队；需要确认持久化时，请显式调用并检查 Sync。
 type AsyncWriter struct {
 	sink    FileSink
 	ch      chan asyncMsg
@@ -77,10 +77,10 @@ type asyncMsg struct {
 // Write 会拷贝 p，调用方可复用缓冲区。
 func OpenAsync(sink FileSink, cfg AsyncConfig) (*AsyncWriter, error) {
 	if sink == nil {
-		return nil, fmt.Errorf("logrotate: async sink 不能为 nil")
+		return nil, errors.New("logrotate: async sink is nil")
 	}
 	if cfg.FullPolicy != FullBlock && cfg.FullPolicy != FullDropNewest {
-		return nil, fmt.Errorf("logrotate: 未知的异步队列满策略 %d", cfg.FullPolicy)
+		return nil, fmt.Errorf("logrotate: invalid async queue full policy %d", cfg.FullPolicy)
 	}
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueueSize
@@ -201,8 +201,9 @@ func (aw *AsyncWriter) Sync() error {
 	}
 }
 
-// Close 停止接收、唤醒等待入队的调用、排空队列、同步并关闭底层。
-// 返回首个后台写入错误以及最终同步和关闭错误（若有）。重复调用返回同一结果。
+// Close 停止接收、唤醒等待入队的调用、排空队列并关闭底层。
+// 不隐式调用 Sync，也不设超时。返回首个后台写入错误及底层关闭错误（若有）。
+// 重复调用返回同一结果。
 func (aw *AsyncWriter) Close() error {
 	aw.closeOnce.Do(func() {
 		aw.admission.Lock()
@@ -212,9 +213,7 @@ func (aw *AsyncWriter) Close() error {
 		close(aw.ch)
 		aw.loopWG.Wait()
 
-		syncErr := aw.sink.Sync()
-		closeErr := aw.sink.Close()
-		aw.closeErr = errors.Join(aw.deliveryErr, syncErr, closeErr)
+		aw.closeErr = errors.Join(aw.deliveryErr, aw.sink.Close())
 	})
 	return aw.closeErr
 }

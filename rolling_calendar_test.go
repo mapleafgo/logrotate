@@ -13,9 +13,12 @@ func TestRollingDailyAcrossDST(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	previous := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = previous })
 	path := filepath.Join(t.TempDir(), "app.log")
 	now := time.Date(2026, 3, 8, 0, 0, 0, 0, loc)
-	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Location: loc, Daily: true}, maxFileBytes: 4}, func() time.Time { return now })
+	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Daily: true}, maxFileBytes: 4}, func() time.Time { return now.UTC() })
 	writeRolling(t, w, "AB")
 	now = now.Add(22 * time.Hour)
 	writeRolling(t, w, "CD")
@@ -36,6 +39,9 @@ func TestRollingRetentionAcrossDST(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	previous := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = previous })
 	path := filepath.Join(t.TempDir(), "app.log")
 	dir := path + ".archives"
 	if err := os.Mkdir(dir, 0755); err != nil {
@@ -48,7 +54,7 @@ func TestRollingRetentionAcrossDST(t *testing.T) {
 	if err := os.Symlink(path+".1", filepath.Join(dir, "2026-03-01.0")); err != nil && !os.IsPermission(err) {
 		t.Fatal(err)
 	}
-	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, Location: loc, HistoryDays: 2}, totalArchiveBytes: 2}, func() time.Time { return time.Date(2026, 3, 9, 0, 30, 0, 0, loc) })
+	w := mustOpen(t, rollingConfig{Config: Config{Filename: path, HistoryDays: 2}, totalArchiveBytes: 2}, func() time.Time { return time.Date(2026, 3, 9, 0, 30, 0, 0, loc).UTC() })
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}

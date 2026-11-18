@@ -61,6 +61,27 @@ func TestRollingRecoverPending(t *testing.T) {
 	}
 }
 
+func TestRollingRecoverPendingWithRotationDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	dir := path + ".archives"
+	if err := os.Mkdir(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(dir, "2026-11-18.0")
+	writeRollingFixture(t, base+".pending", "sealed")
+	w, err := Open(Config{Filename: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRolling(t, w, "active")
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertRollingGzip(t, base+".gz", "sealed")
+	assertRollingAbsent(t, base+".pending")
+	assertRollingContents(t, path, "active")
+}
+
 func writeRollingGzip(t *testing.T, path, value string) {
 	t.Helper()
 	f, err := os.Create(path)

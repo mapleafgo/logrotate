@@ -76,7 +76,7 @@ func archiveEntries(dir string) ([]os.DirEntry, error) {
 		return nil, err
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("logrotate: archive path %s is not a directory", dir)
+		return nil, fmt.Errorf("logrotate: archive path %q is not a directory", dir)
 	}
 	return os.ReadDir(dir)
 }
@@ -86,7 +86,7 @@ func (s *archiveMaintenance) finishPending(base string) error {
 	if exists, err := rollingRegular(base); err != nil {
 		return err
 	} else if exists {
-		return fmt.Errorf("logrotate: archive conflict at %s", base)
+		return fmt.Errorf("logrotate: archive conflict at %q", base)
 	}
 	exists, err := rollingRegular(final)
 	if err != nil {
@@ -94,7 +94,7 @@ func (s *archiveMaintenance) finishPending(base string) error {
 	}
 	if exists {
 		if err := verifyRollingGzip(source, final); err != nil {
-			return fmt.Errorf("logrotate: archive conflict at %s: %w", final, err)
+			return fmt.Errorf("logrotate: archive conflict at %q: %w", final, err)
 		}
 	}
 	if exists, err := rollingRegular(temp); err != nil {
@@ -106,10 +106,10 @@ func (s *archiveMaintenance) finishPending(base string) error {
 	}
 	if !exists {
 		if err := s.compress(source, temp); err != nil {
-			return err
+			return s.discardTemp(temp, fmt.Errorf("logrotate: compress archive %q: %w", source, err))
 		}
 		if err := renameUnused(s.rename, temp, final); err != nil {
-			return err
+			return s.discardTemp(temp, fmt.Errorf("logrotate: publish archive %q: %w", final, err))
 		}
 	}
 	if err := s.archiveSync(s.dir); err != nil {
@@ -125,6 +125,13 @@ func (s *archiveMaintenance) finishPending(base string) error {
 	return err
 }
 
+func (s *archiveMaintenance) discardTemp(path string, cause error) error {
+	if err := s.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.Join(cause, fmt.Errorf("logrotate: discard temporary archive %q: %w", path, err))
+	}
+	return cause
+}
+
 func rollingRegular(path string) (bool, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -134,7 +141,7 @@ func rollingRegular(path string) (bool, error) {
 		return false, err
 	}
 	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("logrotate: not a regular archive: %s", path)
+		return false, fmt.Errorf("logrotate: path %q is not a regular file", path)
 	}
 	return true, nil
 }
@@ -207,7 +214,7 @@ func verifyRollingGzip(source, final string) error {
 }
 
 func syncRollingDir(path string) error {
-	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+	if runtime.GOOS == "windows" {
 		return nil
 	}
 	f, err := os.Open(path)
