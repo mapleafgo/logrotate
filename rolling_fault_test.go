@@ -112,7 +112,7 @@ func TestRollingRecoveryAfterFailure(t *testing.T) {
 	for _, step := range []string{"seal", "reopen", "compress", "publish", "remove"} {
 		t.Run(step, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "app.log")
-			base := path + ".archives/2026-11-18.0"
+			base := filepath.Join(path+".archives", "2026-11-18.0")
 			cfg := rollingConfig{Config: Config{Filename: path, Compress: true}, maxFileBytes: 4}
 			now := func() time.Time { return time.Date(2026, 11, 18, 12, 0, 0, 0, time.Local) }
 			w := mustOpen(t, cfg, now)
