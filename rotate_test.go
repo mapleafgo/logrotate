@@ -179,7 +179,7 @@ func TestAsyncWriterDropNewest(t *testing.T) {
 		t.Fatalf("write keep: %v", err)
 	}
 	<-entered
-	// 填满队列
+	// Fill the queue.
 	if _, err := aw.Write([]byte("queued\n")); err != nil {
 		t.Fatalf("write queued: %v", err)
 	}
